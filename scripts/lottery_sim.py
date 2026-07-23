@@ -18,6 +18,21 @@ def preprocess_image(img_path):
     return binary_color
 
 # ===================== 3. 单图提取所有复式红球蓝球分组 =====================
+def extract_numbers(text):
+    raw_nums = re.findall(r'\d+', text)
+    result = []
+    for num_str in raw_nums:
+        if len(num_str) == 2:
+            result.append(int(num_str))
+        elif len(num_str) > 2:
+            for i in range(0, len(num_str), 2):
+                chunk = num_str[i:i+2]
+                if len(chunk) == 2:
+                    n = int(chunk)
+                    if 1 <= n <= 33:
+                        result.append(n)
+    return result
+
 def parse_lottery_image(img_path):
     img = cv2.imread(img_path)
     result = ocr.predict(img)
@@ -27,35 +42,87 @@ def parse_lottery_image(img_path):
             text_lines.extend(item['rec_texts'])
     full_text = "\n".join(text_lines)
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+    
+
 
     all_groups = []
-    temp_red = None
-
-    # 正则匹配规则
-    red_rule = re.compile(r"红球[:：]\s*((?:\d{2}\s*)+)")
-    blue_rule = re.compile(r"蓝球[:：]\s*((?:\d{2}\s*)+)\s*\[(\d+)倍\]")
-    num_rule = re.compile(r"\d{2}")
+    current_group = None
+    state = None
 
     for line in lines:
-        # 匹配红球行
-        red_match = red_rule.search(line)
+        red_match = re.search(r"红球[:：]\s*(.+)", line)
+        red_dan_match = re.search(r"红胆[:：]\s*(.+)", line)
+        red_tuo_match = re.search(r"红拖[:：]\s*(.+)", line)
+        blue_match = re.search(r"蓝球[:：]\s*(.+)", line)
+        
         if red_match:
-            red_raw = red_match.group(1)
-            red_nums = sorted([int(x) for x in num_rule.findall(red_raw)])
-            temp_red = red_nums
+            if current_group is not None:
+                all_groups.append(current_group)
+            nums = extract_numbers(red_match.group(1))
+            current_group = {"red": nums, "blue": [], "times": 1}
+            state = "collect_red"
             continue
-        # 匹配蓝球行，和上一行红球配对一组
-        blue_match = blue_rule.search(line)
-        if blue_match and temp_red is not None:
-            blue_raw = blue_match.group(1)
-            blue_nums = sorted([int(x) for x in num_rule.findall(blue_raw)])
-            multiple = int(blue_match.group(2))
-            all_groups.append({
-                "red": temp_red,
-                "blue": blue_nums,
-                "times": multiple
-            })
-            temp_red = None
+        
+        if red_dan_match:
+            if current_group is not None:
+                all_groups.append(current_group)
+            nums = extract_numbers(red_dan_match.group(1))
+            current_group = {"red": nums, "red_tuo": [], "blue": [], "times": 1}
+            state = "collect_dan"
+            continue
+        
+        if red_tuo_match:
+            nums = extract_numbers(red_tuo_match.group(1))
+            if current_group is not None:
+                current_group["red_tuo"].extend(nums)
+                state = "collect_tuo"
+            continue
+        
+        if blue_match:
+            if current_group is not None:
+                blue_raw = blue_match.group(1)
+                nums = extract_numbers(blue_raw)
+                current_group["blue"].extend(nums)
+                
+                times_match = re.search(r'(\d+)\s*倍', blue_raw)
+                if times_match:
+                    current_group["times"] = int(times_match.group(1))
+                
+                if 'red_tuo' in current_group:
+                    current_group["red"].extend(current_group.pop("red_tuo"))
+                    current_group["red"] = sorted(list(set(current_group["red"])))
+                
+                all_groups.append(current_group)
+                current_group = None
+                state = None
+            continue
+        
+        if state in ("collect_red", "collect_dan", "collect_tuo") and current_group is not None:
+            nums = extract_numbers(line)
+            if nums:
+                if state == "collect_red":
+                    current_group["red"].extend(nums)
+                elif state == "collect_dan":
+                    current_group["red"].extend(nums)
+                    state = "collect_tuo"
+                elif state == "collect_tuo":
+                    if 'red_tuo' in current_group:
+                        current_group["red_tuo"].extend(nums)
+                    else:
+                        current_group["red"].extend(nums)
+    
+    if current_group is not None:
+        if 'red_tuo' in current_group:
+            current_group["red"].extend(current_group.pop("red_tuo"))
+            current_group["red"] = sorted(list(set(current_group["red"])))
+        all_groups.append(current_group)
+    
+    for g in all_groups:
+        g["red"] = sorted(list(set(g["red"])))
+        g["blue"] = sorted(list(set(g["blue"])))
+        g["red"] = [x for x in g["red"] if 1 <= x <= 33]
+        g["blue"] = [x for x in g["blue"] if 1 <= x <= 16]
+    
     return all_groups
 
 # ===================== 4. 批量遍历文件夹所有图片，汇总全部号码 =====================
