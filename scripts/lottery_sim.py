@@ -1,66 +1,30 @@
-import easyocr
 import cv2
 import re
 import os
 from collections import defaultdict
 import pandas as pd
+from paddleocr import PaddleOCR
 
-# ===================== 1. 模型检查与初始化 =====================
-MODEL_DIR = os.path.join(os.path.dirname(__file__), 'easyocr_models')
-
-REQUIRED_MODELS = {
-    'craft_mlt_25k.pth': 500000,   
-    'zh_sim_g2.pth': 20000000,     
-    'english_g2.pth': 80000000     
-}
-
-def check_models():
-    missing = []
-    for model_name, min_size in REQUIRED_MODELS.items():
-        model_path = os.path.join(MODEL_DIR, model_name)
-        if not os.path.exists(model_path):
-            missing.append(f"  - {model_name} (未找到)")
-        elif os.path.getsize(model_path) < min_size:
-            missing.append(f"  - {model_name} (文件太小，可能下载失败)")
-    return missing
-
-missing_models = check_models()
-if missing_models:
-    print("错误：缺少必要的EasyOCR模型文件！")
-    print("\n缺少的模型：")
-    for m in missing_models:
-        print(m)
-    print(f"\n模型目录：{MODEL_DIR}")
-    print("\n请运行以下命令下载模型：")
-    print("  python3 scripts/download_easyocr_models.py")
-    print("\n或手动下载模型文件放入上述目录：")
-    print("  - craft_mlt_25k.pth (检测模型): ~700KB")
-    print("  - zh_sim_g2.pth (中文识别): ~21MB")
-    print("  - english_g2.pth (英文识别): ~90MB")
-    exit(1)
-
-reader = easyocr.Reader(
-    ['ch_sim','en'],
-    gpu=False,
-    model_storage_directory=MODEL_DIR,
-    download_enabled=False
-)
-
+# ===================== 1. 初始化PaddleOCR（全局只创建一次！） =====================
+# use_angle_cls=False 关闭文字方向检测，提速；lang="ch"支持中文数字
+ocr = PaddleOCR(lang="ch", use_textline_orientation=False, engine="onnxruntime")
 
 # ===================== 2. 图片预处理：去除红色海报干扰 =====================
 def preprocess_image(img_path):
     img = cv2.imread(img_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 二值化，过滤浅色红底水印，强化小票黑色文字
     _, binary_img = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY)
-    return binary_img
+    binary_color = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+    return binary_color
 
 # ===================== 3. 单图提取所有复式红球蓝球分组 =====================
 def parse_lottery_image(img_path):
-    # 预处理图片
-    proc_img = preprocess_image(img_path)
-    # OCR识别全部文字
-    text_lines = reader.readtext(proc_img, detail=0)
+    img = cv2.imread(img_path)
+    result = ocr.predict(img)
+    text_lines = []
+    for item in result:
+        if isinstance(item, dict) and 'rec_texts' in item:
+            text_lines.extend(item['rec_texts'])
     full_text = "\n".join(text_lines)
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
 
@@ -164,7 +128,7 @@ def export_to_excel(all_groups, save_name="双色球全部号码汇总.xlsx"):
 # ===================== 主程序入口 =====================
 if __name__ == "__main__":
     # 1. 修改为你存放彩票图片的文件夹路径
-    IMG_FOLDER = r"./lottery_img"
+    IMG_FOLDER = r"../lottery_img"
 
     # 2. 批量解析所有图片
     all_lottery_groups = batch_parse_images(IMG_FOLDER)
