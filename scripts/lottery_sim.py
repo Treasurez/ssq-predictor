@@ -60,98 +60,212 @@ def is_ssq_related(text):
     match_count = sum(1 for kw in ssq_keywords if kw in text)
     return match_count >= 2
 
+def is_valid_ball_numbers(nums):
+    if len(nums) == 0:
+        return False
+    if len(nums) > 7:
+        return False
+    for n in nums:
+        if not (1 <= n <= 33):
+            return False
+    return True
+
+def parse_region_lines(lines):
+    ball_lines = []
+    
+    for idx, line in enumerate(lines):
+        red_match = re.search(r"红球[:：]\s*(.+)", line)
+        red_dan_match = re.search(r"红胆[:：]\s*(.+)", line)
+        red_tuo_match = re.search(r"红拖[:：]\s*(.+)", line)
+        blue_match = re.search(r"蓝球[:：]\s*(.+)", line)
+        ball_match = re.search(r"球[:：]\s*(.+)", line)
+        
+        if red_match:
+            ball_lines.append({
+                'idx': idx, 'line': line,
+                'type': 'RED',
+                'nums': extract_numbers(red_match.group(1)),
+                'has_times': False
+            })
+        elif red_dan_match:
+            ball_lines.append({
+                'idx': idx, 'line': line,
+                'type': 'RED_DAN',
+                'nums': extract_numbers(red_dan_match.group(1)),
+                'has_times': False
+            })
+        elif red_tuo_match:
+            ball_lines.append({
+                'idx': idx, 'line': line,
+                'type': 'RED_TUO',
+                'nums': extract_numbers(red_tuo_match.group(1)),
+                'has_times': False
+            })
+        elif blue_match:
+            blue_raw = blue_match.group(1)
+            has_times = re.search(r'(\d+)\s*倍', blue_raw) is not None
+            if has_times:
+                blue_clean = re.sub(r'\[?\d+\s*倍\]?', '', blue_raw)
+            else:
+                blue_clean = blue_raw
+            ball_lines.append({
+                'idx': idx, 'line': line,
+                'type': 'BLUE',
+                'nums': extract_numbers(blue_clean),
+                'has_times': has_times
+            })
+        elif ball_match:
+            ball_raw = ball_match.group(1)
+            has_times = re.search(r'(\d+)\s*倍', ball_raw) is not None
+            if has_times:
+                ball_clean = re.sub(r'\[?\d+\s*倍\]?', '', ball_raw)
+                ball_lines.append({
+                    'idx': idx, 'line': line,
+                    'type': 'BALL_BLUE',
+                    'nums': extract_numbers(ball_clean),
+                    'has_times': True
+                })
+            else:
+                nums = extract_numbers(ball_raw)
+                if len(nums) >= 5:
+                    ball_lines.append({
+                        'idx': idx, 'line': line,
+                        'type': 'BALL_RED',
+                        'nums': nums,
+                        'has_times': False
+                    })
+                else:
+                    ball_lines.append({
+                        'idx': idx, 'line': line,
+                        'type': 'BALL_SHORT',
+                        'nums': nums,
+                        'has_times': False
+                    })
+        elif re.match(r'^\s*[\d\s]+\s*$', line):
+            nums = extract_numbers(line)
+            if 2 <= len(nums) <= 4 and all(1 <= n <= 33 for n in nums):
+                ball_lines.append({
+                    'idx': idx, 'line': line,
+                    'type': 'CONTINUE',
+                    'nums': nums,
+                    'has_times': False
+                })
+    
+    all_groups = []
+    current_group = None
+    prev_has_blue = False
+    
+    for bl in ball_lines:
+        btype = bl['type']
+        nums = bl['nums']
+        
+        if btype in ('RED', 'BALL_RED', 'RED_DAN'):
+            if current_group is not None:
+                all_groups.append(current_group)
+            current_group = {"red": list(nums), "blue": [], "times": 1}
+            prev_has_blue = False
+        
+        elif btype == 'RED_TUO':
+            if current_group is not None:
+                current_group['red'].extend(nums)
+            else:
+                current_group = {"red": list(nums), "blue": [], "times": 1}
+            prev_has_blue = False
+        
+        elif btype in ('BLUE', 'BALL_BLUE'):
+            if current_group is not None:
+                current_group['blue'].extend(nums)
+                current_group['times'] = 1
+                all_groups.append(current_group)
+                current_group = None
+                prev_has_blue = True
+            elif all_groups and not prev_has_blue:
+                all_groups[-1]['blue'].extend(nums)
+                all_groups[-1]['times'] = 1
+                prev_has_blue = True
+        
+        elif btype == 'CONTINUE':
+            if current_group is not None and len(current_group['red']) < 7:
+                current_group['red'].extend(nums)
+        
+        elif btype == 'BALL_SHORT':
+            if current_group is not None and len(current_group['red']) < 7:
+                current_group['red'].extend(nums)
+            else:
+                if current_group is not None:
+                    all_groups.append(current_group)
+                current_group = {"red": list(nums), "blue": [], "times": 1}
+                prev_has_blue = False
+    
+    if current_group is not None and len(current_group['red']) >= 5:
+        all_groups.append(current_group)
+    
+    return all_groups
+
 def parse_lottery_image(img_path):
     img = cv2.imread(img_path)
     if img is None:
         return []
     result = ocr.predict(img)
-    text_lines = []
-    for item in result:
-        if isinstance(item, dict) and 'rec_texts' in item:
-            text_lines.extend(item['rec_texts'])
-    full_text = "\n".join(text_lines)
-    lines = [line.strip() for line in full_text.splitlines() if line.strip()]
     
+    item = result[0]
+    rec_texts = item['rec_texts']
+    rec_polys = item['rec_polys']
+    
+    import numpy as np
+    
+    lines_with_coords = []
+    for i, (text, poly) in enumerate(zip(rec_texts, rec_polys)):
+        x_min = int(np.min(poly[:, 0]))
+        x_max = int(np.max(poly[:, 0]))
+        y_min = int(np.min(poly[:, 1]))
+        y_max = int(np.max(poly[:, 1]))
+        y_center = (y_min + y_max) / 2
+        lines_with_coords.append({
+            'text': text,
+            'x_min': x_min,
+            'x_max': x_max,
+            'y_min': y_min,
+            'y_max': y_max,
+            'y_center': y_center
+        })
+    
+    lines_with_coords.sort(key=lambda l: (l['y_center'], l['x_min']))
+    
+    full_text = "\n".join([l['text'] for l in lines_with_coords])
     if not is_ssq_related(full_text):
         return []
-
-    all_groups = []
-    current_group = None
-    state = None
-
-    for line in lines:
-        red_match = re.search(r"红球[:：]\s*(.+)", line)
-        red_dan_match = re.search(r"红胆[:：]\s*(.+)", line)
-        red_tuo_match = re.search(r"红拖[:：]\s*(.+)", line)
-        blue_match = re.search(r"蓝球[:：]\s*(.+)", line)
-        
-        if red_match:
-            if current_group is not None:
-                all_groups.append(current_group)
-            nums = extract_numbers(red_match.group(1))
-            current_group = {"red": nums, "blue": [], "times": 1}
-            state = "collect_red"
-            continue
-        
-        if red_dan_match:
-            if current_group is not None:
-                all_groups.append(current_group)
-            nums = extract_numbers(red_dan_match.group(1))
-            current_group = {"red": nums, "red_tuo": [], "blue": [], "times": 1}
-            state = "collect_dan"
-            continue
-        
-        if red_tuo_match:
-            nums = extract_numbers(red_tuo_match.group(1))
-            if current_group is not None:
-                if 'red_tuo' not in current_group:
-                    all_groups.append(current_group)
-                    current_group = {"red": [], "red_tuo": nums, "blue": [], "times": 1}
-                    state = "collect_tuo"
-                else:
-                    current_group["red_tuo"].extend(nums)
-                    state = "collect_tuo"
-            continue
-        
-        if blue_match:
-            if current_group is not None:
-                blue_raw = blue_match.group(1)
-                times_match = re.search(r'(\d+)\s*倍', blue_raw)
-                if times_match:
-                    current_group["times"] = int(times_match.group(1))
-                    blue_raw = re.sub(r'\[?\d+\s*倍\]?', '', blue_raw)
-                
-                nums = extract_numbers(blue_raw)
-                current_group["blue"].extend(nums)
-                
-                if 'red_tuo' in current_group:
-                    current_group["red"].extend(current_group.pop("red_tuo"))
-                    current_group["red"] = sorted(list(set(current_group["red"])))
-                
-                all_groups.append(current_group)
-                current_group = None
-                state = None
-            continue
-        
-        if state in ("collect_red", "collect_dan", "collect_tuo") and current_group is not None:
-            nums = extract_numbers(line)
-            if nums:
-                if state == "collect_red":
-                    current_group["red"].extend(nums)
-                elif state == "collect_dan":
-                    current_group["red"].extend(nums)
-                    state = "collect_tuo"
-                elif state == "collect_tuo":
-                    if 'red_tuo' in current_group:
-                        current_group["red_tuo"].extend(nums)
-                    else:
-                        current_group["red"].extend(nums)
     
-    if current_group is not None:
-        if 'red_tuo' in current_group:
-            current_group["red"].extend(current_group.pop("red_tuo"))
-            current_group["red"] = sorted(list(set(current_group["red"])))
-        all_groups.append(current_group)
+    threshold = 80
+    clusters = []
+    current_cluster = [lines_with_coords[0]]
+    
+    for i in range(1, len(lines_with_coords)):
+        line = lines_with_coords[i]
+        y_center = line['y_center']
+        
+        cluster_max_y = max(l['y_max'] for l in current_cluster)
+        if y_center - cluster_max_y <= threshold:
+            current_cluster.append(line)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [line]
+    
+    clusters.append(current_cluster)
+    
+    all_groups = []
+    
+    for cluster in clusters:
+        cluster_texts = [l['text'] for l in cluster]
+        cluster_full_text = "\n".join(cluster_texts)
+        
+        ssq_kw = ["双色球", "红球", "蓝球", "红胆", "红拖", "球：", "球:"]
+        ssq_count = sum(1 for kw in ssq_kw if kw in cluster_full_text)
+        
+        if ssq_count >= 2:
+            cluster_lines = [l['text'] for l in cluster]
+            groups = parse_region_lines(cluster_lines)
+            all_groups.extend(groups)
     
     for g in all_groups:
         g["red"] = sorted(list(set(g["red"])))
@@ -270,7 +384,7 @@ if __name__ == "__main__":
     # 微信图片缓存目录（如需使用请取消注释）
     IMG_FOLDER = r"/Users/zhangzhaochao/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/dd599815ed115ac82bd4effdfadab7a5/Message/MessageTemp/9f2fe70ab6257a9a669e2b4026904633/Image"
     
-    EXCEL_FILE = "双色球全部号码汇总.xlsx"
+    EXCEL_FILE = "双色球全部号码汇总1.xlsx"
 
     # 2. 批量解析所有图片（自动过滤非双色球图片、缩略图，支持增量保存）
     all_lottery_groups = batch_parse_images(IMG_FOLDER, save_name=EXCEL_FILE, save_interval=10)
