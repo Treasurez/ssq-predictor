@@ -56,7 +56,7 @@ def extract_numbers(text):
     return result
 
 def is_ssq_related(text):
-    ssq_keywords = ["双色球", "红球", "蓝球", "红胆", "红拖"]
+    ssq_keywords = ["双色球", "红球", "蓝球", "篮球", "监球", "兰球", "红胆", "红拖"]
     match_count = sum(1 for kw in ssq_keywords if kw in text)
     return match_count >= 2
 
@@ -77,7 +77,7 @@ def parse_region_lines(lines):
         red_match = re.search(r"红球[:：]\s*(.+)", line)
         red_dan_match = re.search(r"红胆[:：]\s*(.+)", line)
         red_tuo_match = re.search(r"红拖[:：]\s*(.+)", line)
-        blue_match = re.search(r"蓝球[:：]\s*(.+)", line)
+        blue_match = re.search(r"(?:蓝|篮|监|兰)球[:：]\s*(.+)", line)
         ball_match = re.search(r"球[:：]\s*(.+)", line)
         
         if red_match:
@@ -103,9 +103,9 @@ def parse_region_lines(lines):
             })
         elif blue_match:
             blue_raw = blue_match.group(1)
-            has_times = re.search(r'(\d+)\s*倍', blue_raw) is not None
+            has_times = re.search(r'[\[\(C]?(\d+)\s*倍[\]\)]?', blue_raw) is not None
             if has_times:
-                blue_clean = re.sub(r'\[?\d+\s*倍\]?', '', blue_raw)
+                blue_clean = re.sub(r'[\[\(C]?\d+\s*倍[\]\)]?', '', blue_raw)
             else:
                 blue_clean = blue_raw
             ball_lines.append({
@@ -116,9 +116,9 @@ def parse_region_lines(lines):
             })
         elif ball_match:
             ball_raw = ball_match.group(1)
-            has_times = re.search(r'(\d+)\s*倍', ball_raw) is not None
+            has_times = re.search(r'[\[\(C]?(\d+)\s*倍[\]\)]?', ball_raw) is not None
             if has_times:
-                ball_clean = re.sub(r'\[?\d+\s*倍\]?', '', ball_raw)
+                ball_clean = re.sub(r'[\[\(C]?\d+\s*倍[\]\)]?', '', ball_raw)
                 ball_lines.append({
                     'idx': idx, 'line': line,
                     'type': 'BALL_BLUE',
@@ -142,14 +142,17 @@ def parse_region_lines(lines):
                         'has_times': False
                     })
         elif re.match(r'^\s*[\d\s]+\s*$', line):
-            nums = extract_numbers(line)
-            if 2 <= len(nums) <= 4 and all(1 <= n <= 33 for n in nums):
-                ball_lines.append({
-                    'idx': idx, 'line': line,
-                    'type': 'CONTINUE',
-                    'nums': nums,
-                    'has_times': False
-                })
+            raw_digits = re.findall(r'\d+', line)
+            total_digits = sum(len(d) for d in raw_digits)
+            if total_digits <= 6:
+                nums = extract_numbers(line)
+                if 2 <= len(nums) <= 4 and all(1 <= n <= 33 for n in nums):
+                    ball_lines.append({
+                        'idx': idx, 'line': line,
+                        'type': 'CONTINUE',
+                        'nums': nums,
+                        'has_times': False
+                    })
     
     all_groups = []
     current_group = None
@@ -202,6 +205,27 @@ def parse_region_lines(lines):
     
     return all_groups
 
+def is_ball_line(text):
+    if re.search(r"红球[:：]", text):
+        return True
+    if re.search(r"(?:蓝|篮|监|兰)球[:：]", text):
+        return True
+    if re.search(r"红胆[:：]", text):
+        return True
+    if re.search(r"红拖[:：]", text):
+        return True
+    if re.search(r"球[:：]", text):
+        return True
+    if re.match(r'^\s*[\d\s]+\s*$', text):
+        raw_digits = re.findall(r'\d+', text)
+        total_digits = sum(len(d) for d in raw_digits)
+        if total_digits > 6:
+            return False
+        nums = extract_numbers(text)
+        if 2 <= len(nums) <= 4 and all(1 <= n <= 33 for n in nums):
+            return True
+    return False
+
 def parse_lottery_image(img_path):
     img = cv2.imread(img_path)
     if img is None:
@@ -221,12 +245,14 @@ def parse_lottery_image(img_path):
         y_min = int(np.min(poly[:, 1]))
         y_max = int(np.max(poly[:, 1]))
         y_center = (y_min + y_max) / 2
+        x_center = (x_min + x_max) / 2
         lines_with_coords.append({
             'text': text,
             'x_min': x_min,
             'x_max': x_max,
             'y_min': y_min,
             'y_max': y_max,
+            'x_center': x_center,
             'y_center': y_center
         })
     
@@ -236,35 +262,84 @@ def parse_lottery_image(img_path):
     if not is_ssq_related(full_text):
         return []
     
-    threshold = 80
-    clusters = []
-    current_cluster = [lines_with_coords[0]]
+    ball_lines = [l for l in lines_with_coords if is_ball_line(l['text'])]
     
-    for i in range(1, len(lines_with_coords)):
-        line = lines_with_coords[i]
+    if len(ball_lines) == 0:
+        return []
+    
+    ball_lines.sort(key=lambda l: (l['y_center'], l['x_center']))
+    
+    y_threshold = 80
+    y_clusters = []
+    current_cluster = [ball_lines[0]]
+    
+    for i in range(1, len(ball_lines)):
+        line = ball_lines[i]
         y_center = line['y_center']
         
         cluster_max_y = max(l['y_max'] for l in current_cluster)
-        if y_center - cluster_max_y <= threshold:
+        if y_center - cluster_max_y <= y_threshold:
             current_cluster.append(line)
         else:
-            clusters.append(current_cluster)
+            y_clusters.append(current_cluster)
             current_cluster = [line]
     
-    clusters.append(current_cluster)
+    y_clusters.append(current_cluster)
     
     all_groups = []
     
-    for cluster in clusters:
-        cluster_texts = [l['text'] for l in cluster]
-        cluster_full_text = "\n".join(cluster_texts)
+    for y_cluster in y_clusters:
+        y_cluster.sort(key=lambda l: (l['x_center'], l['y_center']))
         
-        ssq_kw = ["双色球", "红球", "蓝球", "红胆", "红拖", "球：", "球:"]
-        ssq_count = sum(1 for kw in ssq_kw if kw in cluster_full_text)
+        x_threshold = 200
+        x_clusters = []
+        current_x_cluster = [y_cluster[0]]
         
-        if ssq_count >= 2:
-            cluster_lines = [l['text'] for l in cluster]
-            groups = parse_region_lines(cluster_lines)
+        for i in range(1, len(y_cluster)):
+            line = y_cluster[i]
+            x_center = line['x_center']
+            
+            last_x_center = current_x_cluster[-1]['x_center']
+            if x_center - last_x_center <= x_threshold:
+                current_x_cluster.append(line)
+            else:
+                x_clusters.append(current_x_cluster)
+                current_x_cluster = [line]
+        
+        x_clusters.append(current_x_cluster)
+        
+        # 如果有多列，检查是否需要合并
+        # 当某列只有红球行或只有蓝球行时，尝试合并相邻列
+        if len(x_clusters) > 1:
+            merged_clusters = []
+            for xc in x_clusters:
+                # 检查是否有明确的红球/蓝球标记
+                has_red_label = any(re.search(r"红球[:：]|红胆[:：]|红拖[:：]", l['text']) for l in xc)
+                has_blue_label = any(re.search(r"(?:蓝|篮|监|兰)球[:：]", l['text']) for l in xc)
+                has_red_ball = any(re.search(r"球[:：]", l['text']) for l in xc)
+                
+                # 如果当前列没有明确的红球标记，且前一列也没有
+                # 或者当前列没有明确的蓝球标记，尝试合并
+                if merged_clusters:
+                    prev_has_red = any(re.search(r"红球[:：]|红胆[:：]|红拖[:：]", l['text']) for l in merged_clusters[-1])
+                    prev_has_blue = any(re.search(r"(?:蓝|篮|监|兰)球[:：]", l['text']) for l in merged_clusters[-1])
+                    
+                    # 如果前一列有红球但没有蓝球，当前列有蓝球但没有红球，尝试合并
+                    if prev_has_red and not prev_has_blue and has_blue_label and not has_red_label:
+                        merged_clusters[-1].extend(xc)
+                        continue
+                    # 如果前一列有蓝球但没有红球，当前列有红球但没有蓝球，尝试合并
+                    if prev_has_blue and not prev_has_red and has_red_label and not has_blue_label:
+                        merged_clusters[-1].extend(xc)
+                        continue
+                
+                merged_clusters.append(list(xc))
+            x_clusters = merged_clusters
+        
+        for x_cluster in x_clusters:
+            x_cluster.sort(key=lambda l: l['y_center'])
+            x_lines = [l['text'] for l in x_cluster]
+            groups = parse_region_lines(x_lines)
             all_groups.extend(groups)
     
     for g in all_groups:
