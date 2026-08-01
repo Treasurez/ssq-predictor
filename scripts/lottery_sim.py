@@ -127,20 +127,12 @@ def parse_region_lines(lines):
                 })
             else:
                 nums = extract_numbers(ball_raw)
-                if len(nums) >= 5:
-                    ball_lines.append({
-                        'idx': idx, 'line': line,
-                        'type': 'BALL_RED',
-                        'nums': nums,
-                        'has_times': False
-                    })
-                else:
-                    ball_lines.append({
-                        'idx': idx, 'line': line,
-                        'type': 'BALL_SHORT',
-                        'nums': nums,
-                        'has_times': False
-                    })
+                ball_lines.append({
+                    'idx': idx, 'line': line,
+                    'type': 'BALL_RED',
+                    'nums': nums,
+                    'has_times': False
+                })
         elif re.match(r'^\s*[\d\s]+\s*$', line):
             nums = extract_numbers(line)
             if len(nums) >= 1 and all(1 <= n <= 33 for n in nums):
@@ -179,31 +171,31 @@ def parse_region_lines(lines):
                 all_groups.append(current_group)
                 current_group = None
                 prev_has_blue = True
-            elif all_groups and not prev_has_blue:
-                all_groups[-1]['blue'].extend(nums)
-                all_groups[-1]['times'] = 1
-                prev_has_blue = True
             else:
-                # BLUE line without preceding group - create standalone
-                current_group = {"red": [], "blue": list(nums), "times": 1}
-                all_groups.append(current_group)
-                current_group = None
+                # Find the most recent group that doesn't have blue yet
+                found_target = False
+                for g in reversed(all_groups):
+                    if not g.get('blue'):
+                        g['blue'].extend(nums)
+                        g['times'] = 1
+                        found_target = True
+                        break
+                if not found_target:
+                    # No group needs blue - create standalone
+                    current_group = {"red": [], "blue": list(nums), "times": 1}
+                    all_groups.append(current_group)
+                    current_group = None
                 prev_has_blue = True
         
         elif btype == 'CONTINUE':
             if current_group is not None:
                 current_group['red'].extend(nums)
-            elif all_groups and not prev_has_blue:
-                all_groups[-1]['red'].extend(nums)
-        
-        elif btype == 'BALL_SHORT':
-            if current_group is not None:
-                current_group['red'].extend(nums)
             else:
-                if current_group is not None:
-                    all_groups.append(current_group)
-                current_group = {"red": list(nums), "blue": [], "times": 1}
-                prev_has_blue = False
+                # Find the most recent group without enough red to extend
+                for g in reversed(all_groups):
+                    if len(g.get('red', [])) < 7 and not g.get('blue'):
+                        g['red'].extend(nums)
+                        break
     
     if current_group is not None and len(current_group['red']) >= 5:
         all_groups.append(current_group)
@@ -457,10 +449,10 @@ def get_recommend(sorted_red, sorted_blue):
 if __name__ == "__main__":
     # 1. 修改为你存放彩票图片的文件夹路径
     # 默认测试图片目录
-    IMG_FOLDER = r"../lottery_img"
+    # IMG_FOLDER = r"../lottery_img"
     
     # 微信图片缓存目录（如需使用请取消注释）
-    # IMG_FOLDER = r"/Users/zhangzhaochao/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/dd599815ed115ac82bd4effdfadab7a5/Message/MessageTemp/9f2fe70ab6257a9a669e2b4026904633/Image"
+    IMG_FOLDER = r"/Users/zhangzhaochao/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/dd599815ed115ac82bd4effdfadab7a5/Message/MessageTemp/9f2fe70ab6257a9a669e2b4026904633/Image"
     
     EXCEL_FILE = "双色球汇总.xlsx"
 
