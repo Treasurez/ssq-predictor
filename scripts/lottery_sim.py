@@ -142,17 +142,14 @@ def parse_region_lines(lines):
                         'has_times': False
                     })
         elif re.match(r'^\s*[\d\s]+\s*$', line):
-            raw_digits = re.findall(r'\d+', line)
-            total_digits = sum(len(d) for d in raw_digits)
-            if total_digits <= 6:
-                nums = extract_numbers(line)
-                if 2 <= len(nums) <= 4 and all(1 <= n <= 33 for n in nums):
-                    ball_lines.append({
-                        'idx': idx, 'line': line,
-                        'type': 'CONTINUE',
-                        'nums': nums,
-                        'has_times': False
-                    })
+            nums = extract_numbers(line)
+            if len(nums) >= 1 and all(1 <= n <= 33 for n in nums):
+                ball_lines.append({
+                    'idx': idx, 'line': line,
+                    'type': 'CONTINUE',
+                    'nums': nums,
+                    'has_times': False
+                })
     
     all_groups = []
     current_group = None
@@ -186,13 +183,21 @@ def parse_region_lines(lines):
                 all_groups[-1]['blue'].extend(nums)
                 all_groups[-1]['times'] = 1
                 prev_has_blue = True
+            else:
+                # BLUE line without preceding group - create standalone
+                current_group = {"red": [], "blue": list(nums), "times": 1}
+                all_groups.append(current_group)
+                current_group = None
+                prev_has_blue = True
         
         elif btype == 'CONTINUE':
-            if current_group is not None and len(current_group['red']) < 7:
+            if current_group is not None:
                 current_group['red'].extend(nums)
+            elif all_groups and not prev_has_blue:
+                all_groups[-1]['red'].extend(nums)
         
         elif btype == 'BALL_SHORT':
-            if current_group is not None and len(current_group['red']) < 7:
+            if current_group is not None:
                 current_group['red'].extend(nums)
             else:
                 if current_group is not None:
@@ -217,12 +222,8 @@ def is_ball_line(text):
     if re.search(r"球[:：]", text):
         return True
     if re.match(r'^\s*[\d\s]+\s*$', text):
-        raw_digits = re.findall(r'\d+', text)
-        total_digits = sum(len(d) for d in raw_digits)
-        if total_digits > 6:
-            return False
         nums = extract_numbers(text)
-        if 2 <= len(nums) <= 4 and all(1 <= n <= 33 for n in nums):
+        if len(nums) >= 1 and all(1 <= n <= 33 for n in nums):
             return True
     return False
 
@@ -289,7 +290,7 @@ def parse_lottery_image(img_path):
     all_groups = []
     
     for y_cluster in y_clusters:
-        y_cluster.sort(key=lambda l: (l['x_center'], l['y_center']))
+        y_cluster.sort(key=lambda l: (l['x_min'], l['y_center']))
         
         x_threshold = 200
         x_clusters = []
@@ -297,10 +298,12 @@ def parse_lottery_image(img_path):
         
         for i in range(1, len(y_cluster)):
             line = y_cluster[i]
-            x_center = line['x_center']
+            # Check if this line's x-range overlaps or is close to the current cluster's range
+            cluster_x_max = max(l['x_max'] for l in current_x_cluster)
+            line_x_min = line['x_min']
             
-            last_x_center = current_x_cluster[-1]['x_center']
-            if x_center - last_x_center <= x_threshold:
+            # If the new line starts before or within the cluster's x-range (with tolerance)
+            if line_x_min <= cluster_x_max + x_threshold:
                 current_x_cluster.append(line)
             else:
                 x_clusters.append(current_x_cluster)
@@ -454,12 +457,12 @@ def get_recommend(sorted_red, sorted_blue):
 if __name__ == "__main__":
     # 1. 修改为你存放彩票图片的文件夹路径
     # 默认测试图片目录
-    # IMG_FOLDER = r"../lottery_img"
+    IMG_FOLDER = r"../lottery_img"
     
     # 微信图片缓存目录（如需使用请取消注释）
-    IMG_FOLDER = r"/Users/zhangzhaochao/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/dd599815ed115ac82bd4effdfadab7a5/Message/MessageTemp/9f2fe70ab6257a9a669e2b4026904633/Image"
+    # IMG_FOLDER = r"/Users/zhangzhaochao/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/dd599815ed115ac82bd4effdfadab7a5/Message/MessageTemp/9f2fe70ab6257a9a669e2b4026904633/Image"
     
-    EXCEL_FILE = "双色球全部号码汇总1.xlsx"
+    EXCEL_FILE = "双色球汇总.xlsx"
 
     # 2. 批量解析所有图片（自动过滤非双色球图片、缩略图，支持增量保存）
     all_lottery_groups = batch_parse_images(IMG_FOLDER, save_name=EXCEL_FILE, save_interval=10)
