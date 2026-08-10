@@ -14,6 +14,18 @@
   # 仅统计评分（无 GA、无 LLM）
   python scripts/predict_combo.py --no-ga --ga-only
 """
+# 必须在所有其他 import 之前抑制警告，防止 numpy/requests 间接导入 urllib3 时触发
+import warnings
+# 1. 先用 message 过滤（在导入 urllib3 模块本身之前设置）
+warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
+# 2. 然后导入 urllib3 模块，此时过滤器已生效
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    # 3. 再用 category 精确过滤，作为双保险
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except ImportError:
+    pass
+
 import argparse
 import json
 import os
