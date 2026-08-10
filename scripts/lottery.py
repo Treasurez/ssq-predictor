@@ -2,110 +2,306 @@ import easyocr
 import cv2
 import re
 import os
+import sys
 from collections import defaultdict
 import pandas as pd
 
 # ===================== 1. 模型检查与初始化 =====================
-MODEL_DIR = os.path.join(os.path.dirname(__file__), 'easyocr_models')
+# 优先使用项目目录的模型，否则使用 EasyOCR 默认路径
+PROJECT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'easyocr_models')
+DEFAULT_MODEL_DIR = os.path.expanduser('~/.EasyOCR/model')
 
-REQUIRED_MODELS = {
-    'craft_mlt_25k.pth': 500000,   
-    'zh_sim_g2.pth': 20000000,     
-    'english_g2.pth': 80000000     
-}
+REQUIRED_MODELS = ['craft_mlt_25k.pth', 'zh_sim_g2.pth', 'english_g2.pth']
 
-def check_models():
+def check_models(model_dir):
     missing = []
-    for model_name, min_size in REQUIRED_MODELS.items():
-        model_path = os.path.join(MODEL_DIR, model_name)
+    if not os.path.exists(model_dir):
+        return REQUIRED_MODELS
+    for model_name in REQUIRED_MODELS:
+        model_path = os.path.join(model_dir, model_name)
         if not os.path.exists(model_path):
-            missing.append(f"  - {model_name} (未找到)")
-        elif os.path.getsize(model_path) < min_size:
-            missing.append(f"  - {model_name} (文件太小，可能下载失败)")
+            missing.append(model_name)
+        elif os.path.getsize(model_path) < 500000:
+            missing.append(f"{model_name} (文件太小)")
     return missing
 
-missing_models = check_models()
-if missing_models:
-    print("错误：缺少必要的EasyOCR模型文件！")
-    print("\n缺少的模型：")
-    for m in missing_models:
-        print(m)
-    print(f"\n模型目录：{MODEL_DIR}")
-    print("\n请运行以下命令下载模型：")
-    print("  python3 scripts/download_easyocr_models.py")
-    print("\n或手动下载模型文件放入上述目录：")
-    print("  - craft_mlt_25k.pth (检测模型): ~700KB")
-    print("  - zh_sim_g2.pth (中文识别): ~21MB")
-    print("  - english_g2.pth (英文识别): ~90MB")
-    exit(1)
+# 先检查项目目录
+missing_in_project = check_models(PROJECT_MODEL_DIR)
+if not missing_in_project:
+    MODEL_DIR = PROJECT_MODEL_DIR
+    print(f"使用项目目录的 EasyOCR 模型: {MODEL_DIR}")
+else:
+    # 检查默认目录
+    missing_in_default = check_models(DEFAULT_MODEL_DIR)
+    if not missing_in_default:
+        MODEL_DIR = DEFAULT_MODEL_DIR
+        print(f"使用 EasyOCR 默认目录的模型: {MODEL_DIR}")
+    else:
+        # 两个目录都不完整，尝试使用默认路径触发下载
+        print("检测到缺少 EasyOCR 模型文件...")
+        print(f"\n项目目录 {PROJECT_MODEL_DIR} 缺少: {missing_in_project}")
+        print(f"默认目录 {DEFAULT_MODEL_DIR} 缺少: {missing_in_default}")
+        print("\n正在尝试通过 EasyOCR 自动下载模型...")
+        print("（首次下载可能需要几分钟，取决于网络速度）\n")
+        
+        try:
+            reader = easyocr.Reader(
+                ['ch_sim','en'],
+                gpu=False,
+                download_enabled=True,
+                verbose=True
+            )
+            MODEL_DIR = DEFAULT_MODEL_DIR
+            print("\n模型下载完成！")
+        except Exception as e:
+            print(f"\n自动下载失败：{e}")
+            print("\n请手动下载模型文件：")
+            print("  python3 scripts/download_easyocr_models.py")
+            sys.exit(1)
+        
+        # 下载完成后重新检查
+        missing_after = check_models(DEFAULT_MODEL_DIR)
+        if missing_after:
+            print(f"\n下载后仍缺少: {missing_after}")
+            sys.exit(1)
 
+# 创建 Reader
 reader = easyocr.Reader(
     ['ch_sim','en'],
     gpu=False,
     model_storage_directory=MODEL_DIR,
-    download_enabled=False
+    download_enabled=False,
+    verbose=False
 )
+print("EasyOCR 模型加载成功！")
 
 
-# ===================== 2. 图片预处理：去除红色海报干扰 =====================
-def preprocess_image(img_path):
+# ===================== 2. 图片预处理：直接使用原图 =====================
+def load_image(img_path):
+    """加载图片，直接返回原图（BGR格式）"""
     img = cv2.imread(img_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 二值化，过滤浅色红底水印，强化小票黑色文字
-    _, binary_img = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY)
-    return binary_img
+    if img is None:
+        return None
+    return img
 
 # ===================== 3. 单图提取所有复式红球蓝球分组 =====================
-def parse_lottery_image(img_path):
-    # 预处理图片
-    proc_img = preprocess_image(img_path)
-    # OCR识别全部文字
-    text_lines = reader.readtext(proc_img, detail=0)
+def parse_lottery_image(img_path, debug=False):
+    # 直接使用原图进行OCR
+    img = load_image(img_path)
+    if img is None:
+        return []
+    
+    # OCR识别全部文字（使用原图，不做二值化处理）
+    text_lines = reader.readtext(img, detail=0)
     full_text = "\n".join(text_lines)
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+    
+    if debug:
+        print(f"  OCR识别 {len(lines)} 行文本:")
+        for l in lines[:30]:  # 最多显示30行
+            print(f"    {l}")
+    
+    # 尝试解析
+    groups = try_parse_lottery_lines(lines, debug)
+    
+    # 如果原图识别结果不好，尝试灰度图
+    if len(groups) == 0:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        text_lines2 = reader.readtext(gray, detail=0)
+        full_text2 = "\n".join(text_lines2)
+        lines2 = [line.strip() for line in full_text2.splitlines() if line.strip()]
+        
+        if debug:
+            print(f"  [灰度图] OCR识别 {len(lines2)} 行文本:")
+            for l in lines2[:30]:
+                print(f"    {l}")
+        
+        groups = try_parse_lottery_lines(lines2, debug)
+    
+    return groups
 
+def try_parse_lottery_lines(lines, debug=False):
+    """尝试从OCR文本中解析双色球号码
+    
+    处理多种格式：
+    1. 连续行格式: 红球:01 07 13 20 24 28 32 33
+                  蓝球:10 13 14 [1倍]
+    2. 分行格式:   红球:01
+                  07
+                  13
+                  ...
+                  蓝球:10
+                  13
+                  14
+                  [1倍]
+    """
     all_groups = []
-    temp_red = None
-
-    # 正则匹配规则
-    red_rule = re.compile(r"红球[:：]\s*((?:\d{2}\s*)+)")
-    blue_rule = re.compile(r"蓝球[:：]\s*((?:\d{2}\s*)+)\s*\[(\d+)倍\]")
-    num_rule = re.compile(r"\d{2}")
-
+    
+    # 标记当前读取状态
+    reading_red = False
+    reading_blue = False
+    current_red = []
+    current_blue = []
+    current_times = 1
+    
+    # 红球/蓝球开头关键字
+    red_start_patterns = [
+        re.compile(r"红球[:：]?\s*((?:\d{1,2}\s*)*)"),   # 红球: 或 红球
+        re.compile(r"红[:：]\s*((?:\d{1,2}\s*)*)"),     # 红: 或 红
+        re.compile(r"红胆[:：]\s*((?:\d{1,2}\s*)*)"),   # 红胆: 或 红胆
+    ]
+    
+    blue_start_patterns = [
+        re.compile(r"蓝球[:：]?\s*((?:\d{1,2}\s*)*)"),   # 蓝球: 或 蓝球
+        re.compile(r"蓝[:：]\s*((?:\d{1,2}\s*)*)"),     # 蓝: 或 蓝
+        re.compile(r"蓝胆[:：]\s*((?:\d{1,2}\s*)*)"),   # 蓝胆: 或 蓝胆
+    ]
+    
+    # 倍数模式
+    times_pattern = re.compile(r"\[?(\d+)倍\]?")
+    
+    # 纯数字模式
+    pure_num_pattern = re.compile(r"^\s*(\d{1,2})\s*$")
+    
     for line in lines:
-        # 匹配红球行
-        red_match = red_rule.search(line)
-        if red_match:
-            red_raw = red_match.group(1)
-            red_nums = sorted([int(x) for x in num_rule.findall(red_raw)])
-            temp_red = red_nums
+        stripped = line.strip()
+        
+        # 检查是否是红球开头
+        is_red_start = False
+        for pattern in red_start_patterns:
+            match = pattern.match(stripped)
+            if match:
+                is_red_start = True
+                # 提取同行的数字
+                red_part = match.group(1) if match.lastindex and match.lastindex >= 1 else ""
+                nums = re.findall(r"\d{1,2}", red_part)
+                current_red = [int(n) for n in nums if 1 <= int(n) <= 33]
+                reading_red = True
+                reading_blue = False
+                break
+        
+        if is_red_start:
+            # 如果同行没有完整的红球列表，继续读取下一行
+            if len(current_red) < 2:
+                continue
+            # 否则完成红球读取
+            if reading_blue and len(current_blue) >= 1:
+                # 完成一组
+                all_groups.append({
+                    "red": sorted(current_red),
+                    "blue": sorted(current_blue),
+                    "times": current_times
+                })
+            current_red = []
+            current_blue = []
+            current_times = 1
+            reading_red = False
+            reading_blue = False
             continue
-        # 匹配蓝球行，和上一行红球配对一组
-        blue_match = blue_rule.search(line)
-        if blue_match and temp_red is not None:
-            blue_raw = blue_match.group(1)
-            blue_nums = sorted([int(x) for x in num_rule.findall(blue_raw)])
-            multiple = int(blue_match.group(2))
-            all_groups.append({
-                "red": temp_red,
-                "blue": blue_nums,
-                "times": multiple
-            })
-            temp_red = None
+        
+        # 检查是否是蓝球开头
+        is_blue_start = False
+        for pattern in blue_start_patterns:
+            match = pattern.match(stripped)
+            if match:
+                is_blue_start = True
+                # 先保存之前可能读取的红球
+                if len(current_red) >= 2:
+                    pass  # 保持当前红球
+                else:
+                    current_red = []
+                
+                # 提取同行的数字
+                blue_part = match.group(1) if match.lastindex and match.lastindex >= 1 else ""
+                nums = re.findall(r"\d{1,2}", blue_part)
+                current_blue = [int(n) for n in nums if 1 <= int(n) <= 16]
+                reading_blue = True
+                reading_red = False
+                break
+        
+        if is_blue_start:
+            if len(current_blue) >= 1 and reading_red == False:
+                # 如果已有红球，完成这组
+                if len(current_red) >= 2:
+                    all_groups.append({
+                        "red": sorted(current_red),
+                        "blue": sorted(current_blue),
+                        "times": current_times
+                    })
+                    current_red = []
+                    current_blue = []
+                    current_times = 1
+            continue
+        
+        # 检查是否是倍数行
+        times_match = times_pattern.match(stripped)
+        if times_match:
+            try:
+                current_times = int(times_match.group(1))
+            except:
+                current_times = 1
+            
+            # 如果已有红球和蓝球，完成这组
+            if len(current_red) >= 2 and len(current_blue) >= 1:
+                all_groups.append({
+                    "red": sorted(current_red),
+                    "blue": sorted(current_blue),
+                    "times": current_times
+                })
+                current_red = []
+                current_blue = []
+                current_times = 1
+                reading_red = False
+                reading_blue = False
+            continue
+        
+        # 检查是否是纯数字行（可能是延续的红球或蓝球）
+        num_match = pure_num_pattern.match(stripped)
+        if num_match:
+            num = int(num_match.group(1))
+            
+            if reading_red and 1 <= num <= 33:
+                # 正在读取红球
+                if num not in current_red:
+                    current_red.append(num)
+            elif reading_blue and 1 <= num <= 16:
+                # 正在读取蓝球
+                if num not in current_blue:
+                    current_blue.append(num)
+    
+    # 处理最后一组
+    if len(current_red) >= 2 and len(current_blue) >= 1:
+        all_groups.append({
+            "red": sorted(current_red),
+            "blue": sorted(current_blue),
+            "times": current_times
+        })
+    
+    if debug:
+        print(f"  解析到 {len(all_groups)} 组复式")
+        for g in all_groups:
+            print(f"    红球: {g['red']}, 蓝球: {g['blue']}, 倍数: {g['times']}")
+    
     return all_groups
 
 # ===================== 4. 批量遍历文件夹所有图片，汇总全部号码 =====================
-def batch_parse_images(folder_path):
+def batch_parse_images(folder_path, debug=False):
     total_groups = []
     # 遍历jpg/png图片
     for file_name in os.listdir(folder_path):
         if file_name.lower().endswith((".jpg", ".png", ".jpeg")):
             img_full_path = os.path.join(folder_path, file_name)
-            groups = parse_lottery_image(img_full_path)
+            if debug:
+                print(f"\n{'='*60}")
+                print(f"处理图片: {file_name}")
+            groups = parse_lottery_image(img_full_path, debug=debug)
             for g in groups:
                 g["img_name"] = file_name
                 total_groups.append(g)
             print(f"【{file_name}】识别到 {len(groups)} 组复式")
+            if debug and groups:
+                for g in groups:
+                    print(f"  红球: {g['red']}, 蓝球: {g['blue']}, 倍数: {g['times']}")
     print(f"\n全部图片解析完成，总计 {len(total_groups)} 组彩票复式")
     return total_groups
 
@@ -148,7 +344,10 @@ def get_recommend(sorted_red, sorted_blue):
     return hot_red_pool, hot_blue_pool
 
 # ===================== 7. 导出所有彩票分组到Excel备查 =====================
-def export_to_excel(all_groups, save_name="双色球全部号码汇总.xlsx"):
+def export_to_excel(all_groups, save_name=None):
+    if save_name is None:
+        save_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '双色球全部号码汇总.xlsx')
+    save_name = os.path.abspath(save_name)
     data_list = []
     for g in all_groups:
         data_list.append({
@@ -163,11 +362,24 @@ def export_to_excel(all_groups, save_name="双色球全部号码汇总.xlsx"):
 
 # ===================== 主程序入口 =====================
 if __name__ == "__main__":
-    # 1. 修改为你存放彩票图片的文件夹路径
-    IMG_FOLDER = r"./lottery_img"
+    # # 普通运行
+    # python3 scripts/lottery.py
+    # # 调试模式（查看详细 OCR 识别结果）
+    # python3 scripts/lottery.py --debug
+    # # 指定图片目录
+    # python3 scripts/lottery.py --folder ./your_images
+    # 检查是否启用调试模式
+    import argparse
+    parser = argparse.ArgumentParser(description='双色球图片OCR识别')
+    parser.add_argument('--debug', '-d', action='store_true', help='启用调试模式，显示详细OCR输出')
+    parser.add_argument('--folder', '-f', default='../lottery_img', help='图片文件夹路径')
+    args = parser.parse_args()
+    
+    # 1. 设置图片文件夹路径
+    IMG_FOLDER = args.folder
 
     # 2. 批量解析所有图片
-    all_lottery_groups = batch_parse_images(IMG_FOLDER)
+    all_lottery_groups = batch_parse_images(IMG_FOLDER, debug=args.debug)
 
     # 3. 导出全部号码到Excel
     export_to_excel(all_lottery_groups)
