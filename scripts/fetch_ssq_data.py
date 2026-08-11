@@ -299,7 +299,6 @@ def analyze_data(data):
 def main():
     output_dir = Path(__file__).parent.parent
     history_file = output_dir / "ssq_history.json"
-    backup_file = output_dir / "ssq_history.json.bak"
     analysis_file = output_dir / "ssq_analysis.json"
 
     print("=" * 60)
@@ -326,16 +325,38 @@ def main():
 
     print("\n检测到有新数据可获取...")
 
-    # 备份现有数据
+    # 备份现有数据（带时间戳，自动保留最近3个）
     if history_file.exists() and before_count > 0:
-        shutil.copy(history_file, backup_file)
-        print(f"已备份到: {backup_file.name}")
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamped_backup = output_dir / f"ssq_history.json.bak.{timestamp}"
+        shutil.copy(history_file, timestamped_backup)
+        print(f"已备份到: {timestamped_backup.name}")
 
-    # 自动计算年份范围：2003年至明年
+        # 清理旧备份，按修改时间倒序，只保留最近3个
+        backups = sorted(
+            output_dir.glob("ssq_history.json.bak.*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        for old_backup in backups[3:]:
+            old_backup.unlink()
+            print(f"  清理旧备份: {old_backup.name}")
+
+    # 增量获取策略：以现有数据中"最新一期的期号"为标记点
+    # - 已有历史数据：仅从标记点所在年份(向前回退1年作为跨年边界缓冲)开始获取
+    # - 无历史数据(首次运行)：从 2003 年开始全量获取
+    # 期号前 4 位即年份，例如 2024001 -> 2024
     current_year = datetime.now().year
-    years_to_fetch = list(range(2003, current_year + 2))
+    if latest_record and latest_record.get('issue'):
+        mark_year = int(latest_record['issue'][:4])
+        start_year = max(2003, mark_year - 1)  # 回退1年，避免跨年边界遗漏
+        print(f"\n已记录标记点: 第 {latest_record['issue']} 期 ({latest_record['date']})")
+        print(f"增量获取 {start_year}-{current_year + 1} 年数据 (跳过 {start_year - 2003} 年旧数据)...")
+    else:
+        start_year = 2003
+        print(f"\n首次运行，全量获取 2003-{current_year + 1} 年历史数据...")
 
-    print(f"\n开始获取 2003-{current_year + 1} 年历史数据...")
+    years_to_fetch = list(range(start_year, current_year + 2))
 
     for year in years_to_fetch:
         print(f"  获取 {year} 年数据...", end=" ")
@@ -349,7 +370,8 @@ def main():
 
         time.sleep(1)  # 请求间隔1秒
 
-    print(f"\n获取最新100期数据...")
+    # 最新100期作为安全网，确保捕获最近开奖
+    print(f"\n获取最新100期数据(安全校验)...")
     recent_data = fetch_recent(100)
     if recent_data:
         all_data, added = merge_data(all_data, recent_data)
