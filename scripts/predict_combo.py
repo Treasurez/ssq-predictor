@@ -39,11 +39,16 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPT_DIR)
 
-from ml_score import (
+# 导入全局配置
+from config import (
+    COMBO_SCORE_TXT, COMBO_GA_TXT, combo_final_txt
+)
+
+from scripts.llm.ml_score import (
     HistoricalDistributions, CombinationScorer,
     load_combinations, load_analysis_data, format_scored_report,
 )
-from ga_optimize import GeneticOptimizer, format_ga_report, POP_SIZE, GENERATIONS
+from scripts.llm.ga_optimize import GeneticOptimizer, format_ga_report, POP_SIZE, GENERATIONS
 from llm_analyze import analyze as llm_analyze
 
 
@@ -218,7 +223,7 @@ def main():
           % (scored[0][2], scored[len(scored) // 2][2], scored[-1][2]))
 
     # 输出统计评分报告
-    scored_path = os.path.join(SCRIPT_DIR, "双色球组合_统计评分.txt")
+    scored_path = COMBO_SCORE_TXT
     format_scored_report(scored[:args.top_n], scored_path)
     print("  已输出: %s" % scored_path)
 
@@ -245,7 +250,7 @@ def main():
         print("  Top %d 中有 %d 个候选集外新发现" % (len(ga_top), new_count))
 
         # 输出 GA 报告
-        ga_path = os.path.join(SCRIPT_DIR, "双色球组合_GA优化.txt")
+        ga_path = COMBO_GA_TXT
         format_ga_report(ga_top, ga_history, ga_path)
         print("  已输出: %s" % ga_path)
     else:
@@ -281,8 +286,7 @@ def main():
     if args.output:
         output_path = args.output
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        output_path = os.path.join(SCRIPT_DIR, "双色球组合_最终推荐_%s.txt" % timestamp)
+        output_path = combo_final_txt()
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(final_report + "\n")

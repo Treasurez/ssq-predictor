@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 双色球号码出现概率统计
-从 双色球汇总.xlsx 统计每个红球(1-33)和蓝球(1-16)的出现概率
+从 最新的双色球全部号码汇总_YYYYMMDD.xlsx 统计每个红球(1-33)和蓝球(1-16)的出现概率
 
 两个维度：
   1. 组级出现率 = 包含该号码的复式组数 / 总组数
@@ -10,15 +10,22 @@
      （展开为6+1单式后，该号码在多少个组合中出现）
 """
 import os
+import sys
 from itertools import combinations
 from collections import defaultdict
 
 import pandas as pd
 
+# 导入全局配置
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    get_summary_xlsx_or_exit, PROBABILITY_TXT
+)
+
 # ===================== 路径配置 =====================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-EXCEL_PATH = os.path.join(SCRIPT_DIR, "双色球汇总.xlsx")
-OUTPUT_PATH = os.path.join(SCRIPT_DIR, "双色球号码出现概率.txt")
+EXCEL_PATH = get_summary_xlsx_or_exit()   # 自动定位最新汇总 xlsx
+OUTPUT_PATH = PROBABILITY_TXT
 
 # 红球全选阈值：红球数 >= 此值的组跳过展开（组合爆炸）
 FULL_SET_THRESHOLD = 20
@@ -91,7 +98,7 @@ def main():
     lines.append("         双色球号码出现概率统计报告")
     lines.append("=" * 70)
     lines.append("")
-    lines.append(f"【数据来源】 双色球汇总.xlsx")
+    lines.append(f"【数据来源】 {os.path.basename(EXCEL_PATH)}")
     lines.append(f"【复式组数】 {total_groups} 组")
     lines.append(f"【展开组合】 {total_combos} 组（跳过全选组红球≥{FULL_SET_THRESHOLD}）")
     lines.append("")

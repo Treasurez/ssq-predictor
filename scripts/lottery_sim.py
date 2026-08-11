@@ -1,9 +1,14 @@
 import cv2
 import re
 import os
+import sys
 from collections import defaultdict
 import pandas as pd
 from paddleocr import PaddleOCR
+
+# 导入全局配置（确保能找到同目录的 config 模块）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import LOTTERY_SUMMARY_PATH, LOTTERY_SUMMARY_XLSX
 
 # ===================== 1. 初始化PaddleOCR（全局只创建一次！） =====================
 # use_angle_cls=False 关闭文字方向检测，提速；lang="ch"支持中文数字
@@ -346,7 +351,7 @@ def parse_lottery_image(img_path):
     return all_groups
 
 # ===================== 4. 批量遍历文件夹所有图片，汇总全部号码 =====================
-def batch_parse_images(folder_path, save_name="双色球全部号码汇总.xlsx", save_interval=10):
+def batch_parse_images(folder_path, save_name=LOTTERY_SUMMARY_PATH, save_interval=10):
     total_groups = []
     skipped = 0
     failed = 0
@@ -454,10 +459,8 @@ if __name__ == "__main__":
     # 微信图片缓存目录（如需使用请取消注释）
     IMG_FOLDER = r"/Users/zhangzhaochao/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/dd599815ed115ac82bd4effdfadab7a5/Message/MessageTemp/9f2fe70ab6257a9a669e2b4026904633/Image"
     
-    EXCEL_FILE = "双色球汇总.xlsx"
-
     # 2. 批量解析所有图片（自动过滤非双色球图片、缩略图，支持增量保存）
-    all_lottery_groups = batch_parse_images(IMG_FOLDER, save_name=EXCEL_FILE, save_interval=10)
+    all_lottery_groups = batch_parse_images(IMG_FOLDER, save_name=LOTTERY_SUMMARY_PATH, save_interval=10)
 
     # 3. 计算冷热号频次
     red_hot_sort, blue_hot_sort = calc_hot_cold(all_lottery_groups)

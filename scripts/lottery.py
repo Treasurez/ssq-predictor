@@ -6,6 +6,10 @@ import sys
 from collections import defaultdict
 import pandas as pd
 
+# 导入全局配置（确保能找到同目录的 config 模块）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import LOTTERY_SUMMARY_PATH
+
 # ===================== 1. 模型检查与初始化 =====================
 # 优先使用项目目录的模型，否则使用 EasyOCR 默认路径
 PROJECT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'easyocr_models')
@@ -346,7 +350,7 @@ def get_recommend(sorted_red, sorted_blue):
 # ===================== 7. 导出所有彩票分组到Excel备查 =====================
 def export_to_excel(all_groups, save_name=None):
     if save_name is None:
-        save_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '双色球全部号码汇总.xlsx')
+        save_name = LOTTERY_SUMMARY_PATH
     save_name = os.path.abspath(save_name)
     data_list = []
     for g in all_groups:

@@ -1,23 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 双色球复式组合展开器
-1. 从 双色球汇总.xlsx 读取 26 组复式号码
+1. 从 最新的双色球全部号码汇总_YYYYMMDD.xlsx 读取复式号码
 2. 展开所有可能的 6红+1蓝 单式组合
 3. 去除历史开奖重复组合
 4. 按出席率（被多少组复式覆盖）排序输出
 """
 import json
 import os
+import sys
 from itertools import combinations
 from collections import defaultdict
 
 import pandas as pd
 
+# 导入全局配置
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    get_summary_xlsx_or_exit, COMBO_ATTEND_TXT
+)
+
 # ===================== 路径配置 =====================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXCEL_PATH = os.path.join(os.path.dirname(__file__), "双色球汇总.xlsx")
+EXCEL_PATH = get_summary_xlsx_or_exit()   # 自动定位最新汇总 xlsx
 HISTORY_PATH = os.path.join(BASE_DIR, "ssq_history.json")
-OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "双色球组合_出席率排序.txt")
+OUTPUT_PATH = COMBO_ATTEND_TXT
 
 # 红球全选阈值：红球数 >= 此值的组视为"全选"，不具筛选意义，跳过展开
 FULL_SET_THRESHOLD = 20
@@ -169,7 +176,7 @@ def main():
     lines.append("=" * 70)
     lines.append("")
     lines.append(f"【数据来源】")
-    lines.append(f"  复式分组: {len(groups)} 组（来自 双色球汇总.xlsx）")
+    lines.append(f"  复式分组: {len(groups)} 组（来自 {os.path.basename(EXCEL_PATH)}）")
     lines.append(f"  历史开奖: {history_count} 条（来自 ssq_history.json）")
     lines.append(f"  参与展开: {len(used_groups)} 组")
     if skipped_groups:

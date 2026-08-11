@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-从 双色球汇总.xlsx 生成 txt 文本文件
+从 最新的双色球全部号码汇总_YYYYMMDD.xlsx 生成 txt 文本文件
 格式：每行一组「红球 + 蓝球」，号码空格分隔
 示例：3 7 9 11 13 14 16 20 22 28 29 31 + 11 13 15
 """
 import pandas as pd
 import os
+import sys
 
-EXCEL_PATH = os.path.join(os.path.dirname(__file__), "双色球汇总.xlsx")
-TXT_PATH = os.path.join(os.path.dirname(__file__), "双色球汇总.txt")
+# 导入全局配置
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    get_summary_xlsx_or_exit, LOTTERY_SUMMARY_TXT
+)
+
+EXCEL_PATH = get_summary_xlsx_or_exit()   # 自动定位最新汇总 xlsx
+TXT_PATH = LOTTERY_SUMMARY_TXT
 
 
 def parse_nums(cell):
