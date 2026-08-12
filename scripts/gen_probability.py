@@ -11,8 +11,9 @@
 """
 import os
 import sys
+import json
 from itertools import combinations
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import pandas as pd
 
@@ -53,6 +54,137 @@ def load_groups():
                 "blue_count": len(blue),
             })
     return groups
+
+
+# ===================== 蓝球综合评分（4 维度）=====================
+# ① 历史频率分 40% - 近 100 期出现率（反映真实热度）
+# ② 遗漏回补分 30% - 遗漏期数越长越可能回补
+# ③ 复式人气分 15% - 复式出现率（彩民群体偏好）
+# ④ 偏差修正分 15% - 历史频率 - 复式人气（被低估加分）
+
+BLUE_HISTORY_WINDOW = 100  # 蓝球历史分析窗口（近 N 期）
+
+
+def load_history():
+    """加载历史开奖数据用于蓝球分析，返回 None 表示无历史数据"""
+    history_path = os.path.join(os.path.dirname(SCRIPT_DIR), "ssq_history.json")
+    if not os.path.exists(history_path):
+        return None
+    try:
+        with open(history_path, "r", encoding="utf-8") as f:
+            history = json.load(f)
+        history.sort(key=lambda x: x["issue"])
+        for item in history:
+            item["blue_ball"] = int(item["blue_ball"])
+        return history
+    except Exception:
+        return None
+
+
+def analyze_blue_history(history, window=BLUE_HISTORY_WINDOW):
+    """分析蓝球历史规律：频率、遗漏、区间、奇偶、大小"""
+    n = min(window, len(history))
+    recent = history[-n:]
+
+    # 近 N 期频率
+    freq = Counter(item["blue_ball"] for item in recent)
+    freq_pct = {b: freq.get(b, 0) / n * 100 for b in range(1, 17)}
+
+    # 遗漏期数（截至最新一期）
+    gap = {}
+    for b in range(1, 17):
+        g = 0
+        for item in reversed(history):
+            if item["blue_ball"] == b:
+                break
+            g += 1
+        gap[b] = g
+
+    # 区间分布
+    zones_def = [(1, 4), (5, 8), (9, 12), (13, 16)]
+    zones = {}
+    for lo, hi in zones_def:
+        cnt = sum(1 for item in recent if lo <= item["blue_ball"] <= hi)
+        zones[f"{lo:02d}-{hi:02d}"] = cnt / n * 100
+
+    # 奇偶/大小
+    odd_pct = sum(1 for item in recent if item["blue_ball"] % 2 == 1) / n * 100
+    big_pct = sum(1 for item in recent if item["blue_ball"] >= 9) / n * 100
+
+    return {
+        "window": n,
+        "total": len(history),
+        "freq": freq,
+        "freq_pct": freq_pct,
+        "gap": gap,
+        "zones": zones,
+        "odd_pct": odd_pct,
+        "big_pct": big_pct,
+    }
+
+
+def blue_comprehensive_score(b, hist_info, comp_pct):
+    """计算蓝球综合评分（4 维度加权）
+
+    返回 (总分 0-100, 各维度详情 dict)
+    """
+    if hist_info is None:
+        # 无历史数据时退化为纯复式人气
+        comp_score = min(comp_pct / 16 * 100, 100)
+        return comp_score, {
+            "freq_pct": 0, "gap": 0, "comp_pct": comp_pct, "dev": 0,
+            "freq_score": 0, "gap_score": 0, "comp_score": comp_score, "dev_score": 50,
+        }
+
+    # ① 历史频率分（0-100）：近 100 期出现率，理论 6.25%，最高约 12%
+    freq_pct = hist_info["freq_pct"].get(b, 0)
+    freq_score = min(freq_pct / 12 * 100, 100)
+
+    # ② 遗漏回补分（0-100）：遗漏 0 期=0 分，遗漏 50 期=100 分
+    gap = hist_info["gap"].get(b, 0)
+    gap_score = min(gap / 50 * 100, 100)
+
+    # ③ 复式人气分（0-100）：复式出现率，最高约 16%
+    comp_score = min(comp_pct / 16 * 100, 100)
+
+    # ④ 偏差修正分（0-100）：历史频率 - 复式人气，正偏差（被低估）加分
+    dev = freq_pct - comp_pct
+    dev_score = max(0, min((dev + 10) / 20 * 100, 100))
+
+    total = freq_score * 0.4 + gap_score * 0.3 + comp_score * 0.15 + dev_score * 0.15
+
+    return total, {
+        "freq_pct": freq_pct,
+        "gap": gap,
+        "comp_pct": comp_pct,
+        "dev": dev,
+        "freq_score": freq_score,
+        "gap_score": gap_score,
+        "comp_score": comp_score,
+        "dev_score": dev_score,
+    }
+
+
+def blue_eval_label(b, info):
+    """根据各维度分布给出简短评价"""
+    labels = []
+    if info["freq_pct"] >= 9:
+        labels.append("近期热")
+    elif info["freq_pct"] <= 3:
+        labels.append("近期冷")
+    if info["gap"] >= 40:
+        labels.append("超长遗漏待回补")
+    elif info["gap"] >= 20:
+        labels.append("长遗漏待回补")
+    if info["dev"] >= 3:
+        labels.append("被彩民低估")
+    elif info["dev"] <= -3:
+        labels.append("被彩民高估")
+    if info["comp_pct"] >= 12:
+        labels.append("人气高")
+    elif info["comp_pct"] <= 2:
+        labels.append("人气低")
+    return " + ".join(labels) if labels else "正常"
 
 
 def main():
@@ -159,60 +291,129 @@ def main():
     lines.append(f"  冷号(<25%): {' '.join(f'{r:02d}' for r in cold_reds) if cold_reds else '无'}")
     lines.append("")
 
-    # --- 蓝球概率 ---
+    # --- 蓝球综合评分（历史开奖 + 复式人气 双数据源融合）---
+    history = load_history()
+    hist_info = analyze_blue_history(history) if history else None
+
     lines.append("─" * 70)
-    lines.append("【蓝球 1-16 出现概率】")
+    lines.append("【蓝球 1-16 综合评分】（历史开奖 + 复式人气 双数据源融合）")
     lines.append("─" * 70)
     lines.append("")
-    lines.append(f"  号码  组级出现率          组合级出现率         理论概率    偏差")
+
+    if hist_info:
+        lines.append(f"数据源:")
+        lines.append(f"  ① 历史开奖: {hist_info['total']} 期（分析近 {hist_info['window']} 期）")
+        lines.append(f"  ② 复式人气: {total_groups} 组复式")
+        lines.append("")
+        lines.append(f"评分维度（权重）:")
+        lines.append(f"  ① 历史频率分 40% - 近 {hist_info['window']} 期出现率（反映真实热度）")
+        lines.append(f"  ② 遗漏回补分 30% - 遗漏期数越长越可能回补")
+        lines.append(f"  ③ 复式人气分 15% - 复式出现率（彩民群体偏好）")
+        lines.append(f"  ④ 偏差修正分 15% - 历史频率 - 复式人气（被低估加分）")
+    else:
+        lines.append(f"⚠ 未找到 ssq_history.json，仅使用复式人气评分")
+        lines.append(f"评分维度:")
+        lines.append(f"  ③ 复式人气分 100% - 复式出现率（无历史数据）")
+    lines.append("")
+
+    # 计算所有蓝球综合评分
+    blue_scores = {}
+    for b in range(1, 17):
+        comp_pct = blue_group_count.get(b, 0) / total_groups * 100
+        total_score, info = blue_comprehensive_score(b, hist_info, comp_pct)
+        info["total_score"] = total_score
+        info["combo_count"] = blue_combo_count.get(b, 0)
+        info["combo_pct"] = blue_combo_count.get(b, 0) / total_combos * 100 if total_combos > 0 else 0
+        blue_scores[b] = info
+
+    # 按综合分降序
+    blue_ranked = sorted(range(1, 17), key=lambda b: -blue_scores[b]["total_score"])
+
+    # 综合评分表
+    lines.append(f"  排名 蓝球  综合分 ┃ 历史频率  遗漏  复式人气  偏差   ┃ 评价")
+    lines.append(f"  ──── ──── ─────── ┃ ──────── ───── ──────── ────── ┃ ──────────────")
+    for rank, b in enumerate(blue_ranked, 1):
+        s = blue_scores[b]
+        gap_str = f"{s['gap']:3d}期" if hist_info else "  - "
+        hist_str = f"{s['freq_pct']:5.1f}%" if hist_info else "  -   "
+        lines.append(
+            f"  #{rank:02d}  {b:02d}   {s['total_score']:5.1f} ┃ "
+            f"{hist_str}  {gap_str}  {s['comp_pct']:5.1f}%  {s['dev']:+5.1f}% ┃ "
+            f"{blue_eval_label(b, s)}"
+        )
+
+    # 各维度分项（帮助理解评分来源）
+    lines.append("")
+    lines.append(f"  ── 各维度分项（0-100）──")
+    lines.append(f"  蓝球  综合  ┃ 历史频率 遗漏回补 复式人气 偏差修正")
+    lines.append(f"  ──── ───── ┃ ──────── ──────── ──────── ────────")
+    for b in blue_ranked:
+        s = blue_scores[b]
+        lines.append(
+            f"  {b:02d}   {s['total_score']:5.1f} ┃ "
+            f"  {s['freq_score']:5.1f}   {s['gap_score']:5.1f}   {s['comp_score']:5.1f}   {s['dev_score']:5.1f}"
+        )
+
+    # 历史规律分析
+    if hist_info:
+        lines.append("")
+        lines.append(f"  ── 蓝球历史规律分析（近 {hist_info['window']} 期）──")
+        lines.append(f"  奇偶: 奇 {hist_info['odd_pct']:.1f}% | 偶 {100-hist_info['odd_pct']:.1f}% (理论各 50%)")
+        lines.append(f"  大小: 小(1-8) {100-hist_info['big_pct']:.1f}% | 大(9-16) {hist_info['big_pct']:.1f}% (理论各 50%)")
+        lines.append(f"  区间分布:")
+        for zone, pct in hist_info["zones"].items():
+            bar_len = int(pct / 2)
+            bar = "█" * bar_len
+            lines.append(f"    {zone}: {pct:5.1f}% {bar} (理论 25%)")
+
+        # 遗漏期数表
+        lines.append("")
+        lines.append(f"  ── 蓝球遗漏期数表（截至最新一期）──")
+        gap_sorted = sorted(range(1, 17), key=lambda b: -hist_info["gap"][b])
+        for b in gap_sorted:
+            gap = hist_info["gap"][b]
+            bar_len = min(int(gap / 2), 40)
+            bar = "▁" * bar_len
+            tag = ""
+            if gap >= 40:
+                tag = " ←超长遗漏"
+            elif gap >= 20:
+                tag = " ←长遗漏"
+            lines.append(f"    {b:02d}: 遗漏 {gap:3d} 期 {bar}{tag}")
+
+    # 复式人气原始统计（保留作为参考）
+    lines.append("")
+    lines.append(f"  ── 蓝球复式人气原始统计（{total_groups} 组）──")
+    lines.append(f"  蓝球  组级出现率          组合级出现率         理论概率    偏差")
     lines.append(f"  ──── ────────────────── ────────────────── ──────── ────────")
-
-    blue_sorted = sorted(range(1, 17), key=lambda b: -blue_group_count.get(b, 0))
-
-    for b in blue_sorted:
+    for b in sorted(range(1, 17), key=lambda b: -blue_group_count.get(b, 0)):
         g_count = blue_group_count.get(b, 0)
         g_pct = g_count / total_groups * 100
-
         c_count = blue_combo_count.get(b, 0)
         c_pct = c_count / total_combos * 100 if total_combos > 0 else 0
-
-        theory = 1 / 16 * 100  # 6.25%
+        theory = 1 / 16 * 100
         deviation = c_pct - theory
-
         bar_len = int(g_pct / 2)
         bar = "█" * bar_len
-
         lines.append(
             f"  {b:02d}   {g_count:2d}/{total_groups} = {g_pct:5.1f}% {bar:<22s}"
             f"  {c_count:4d}/{total_combos} = {c_pct:5.1f}%   "
             f"{theory:5.1f}%   {deviation:+5.1f}%"
         )
 
-    # 蓝球统计摘要
+    # Top 5 综合推荐
     lines.append("")
-    lines.append("  ── 蓝球统计摘要 ──")
-    blue_pcts = [blue_group_count.get(b, 0) / total_groups * 100 for b in range(1, 17)]
-    blue_combo_pcts = [blue_combo_count.get(b, 0) / total_combos * 100 if total_combos > 0 else 0 for b in range(1, 17)]
-    lines.append(f"  组级出现率  最高: {max(blue_pcts):.1f}%  最低: {min(blue_pcts):.1f}%  "
-                 f"均值: {sum(blue_pcts)/len(blue_pcts):.1f}%")
-    lines.append(f"  组合级出现率 最高: {max(blue_combo_pcts):.1f}%  最低: {min(blue_combo_pcts):.1f}%  "
-                 f"均值: {sum(blue_combo_pcts)/len(blue_combo_pcts):.1f}%")
-    lines.append(f"  理论概率: {1/16*100:.1f}%（每注选1个蓝球/共16个）")
-
-    # 蓝球热度分级
-    hot_blues = [b for b in range(1, 17) if blue_group_count.get(b, 0) / total_groups >= 0.20]
-    warm_blues = [b for b in range(1, 17) if 0.10 <= blue_group_count.get(b, 0) / total_groups < 0.20]
-    cold_blues = [b for b in range(1, 17) if blue_group_count.get(b, 0) / total_groups < 0.10]
-    lines.append("")
-    lines.append(f"  热号(≥20%): {' '.join(f'{b:02d}' for b in hot_blues) if hot_blues else '无'}")
-    lines.append(f"  温号(10-20%): {' '.join(f'{b:02d}' for b in warm_blues) if warm_blues else '无'}")
-    lines.append(f"  冷号(<10%): {' '.join(f'{b:02d}' for b in cold_blues) if cold_blues else '无'}")
+    lines.append(f"  ══ 蓝球综合推荐 Top 5 ══")
+    for rank, b in enumerate(blue_ranked[:5], 1):
+        s = blue_scores[b]
+        lines.append(f"  #{rank}  蓝球 {b:02d}  评分 {s['total_score']:.1f}  - {blue_eval_label(b, s)}")
     lines.append("")
 
     lines.append("─" * 70)
-    lines.append("  说明：组级出现率反映彩民对该号码的偏好程度（人气指标），")
-    lines.append("        组合级出现率反映该号码在所有展开组合中的实际覆盖比例。")
-    lines.append("        偏差为正表示该号码被高估（过热），偏差为负表示被低估（偏冷）。")
+    lines.append("  说明：红球部分 - 组级/组合级出现率均基于复式人气统计。")
+    lines.append("        蓝球部分 - 采用 4 维度综合评分（历史频率 40% + 遗漏回补 30% +")
+    lines.append("                   复式人气 15% + 偏差修正 15%），融合历史开奖与复式人气。")
+    lines.append("        偏差 = 历史频率 - 复式人气，正值表示被彩民低估，负值表示被高估。")
     lines.append("─" * 70)
 
     output_text = "\n".join(lines)
@@ -226,3 +427,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #09 11 12 25 30 33 11
