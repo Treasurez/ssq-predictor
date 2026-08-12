@@ -138,148 +138,372 @@ def try_parse_lottery_lines(lines, debug=False):
                   13
                   14
                   [1倍]
+    3. 胆拖格式:   红胆:07 12 23 24
+                  红拖:02 04 06 08 11 15 19
+                  蓝球:01 02
+                  [1倍]
+    4. OCR误读格式: 红爬:02, 红皿:01, 蓝琛:09, [5倚] 等
     """
+    
+    # ====== 辅助函数（模块级，避免闭包变量问题） ======
+    def extract_red_nums(text):
+        """从文本中提取红球号码(1-33)"""
+        nums = []
+        for m in re.findall(r"(\d{1,2})", text):
+            n = int(m)
+            if 1 <= n <= 33 and n not in nums:
+                nums.append(n)
+        return nums
+    
+    def extract_blue_nums(text):
+        """从文本中提取蓝球号码(1-16)"""
+        nums = []
+        for m in re.findall(r"(\d{1,2})", text):
+            n = int(m)
+            if 1 <= n <= 16 and n not in nums:
+                nums.append(n)
+        return nums
+    
+    def extract_times(text):
+        """从文本中提取倍数"""
+        for pat in [r"\[?(\d+)倍\]?", r"\[?(\d+)倚\]?", r"(\d+)倍", r"(\d+)倚"]:
+            m = re.search(pat, text)
+            if m:
+                try:
+                    t = int(m.group(1))
+                    if 1 <= t <= 100:
+                        return t
+                except:
+                    pass
+        return None
+    
+    # ====== 状态变量 ======
     all_groups = []
     
-    # 标记当前读取状态
-    reading_red = False
-    reading_blue = False
-    current_red = []
-    current_blue = []
-    current_times = 1
+    reading_red = [False]      # 是否正在读取红球
+    reading_blue = [False]     # 是否正在读取蓝球
+    current_red = [[]]         # 当前红球列表
+    current_blue = [[]]        # 当前蓝球列表
+    current_times = [1]        # 当前倍数
+    current_red_dan = [[]]     # 胆拖格式-胆码
+    current_red_tuo = [[]]     # 胆拖格式-拖码
+    in_dantuo_mode = [False]   # 是否胆拖模式
+    passed_tuo = [False]       # 胆拖模式下是否已过"红拖"标记
+    # 红球队列：当多个红球组连续出现时，先缓存红球队列，等待蓝球配对
+    pending_red_groups = []    # 每个元素: {"red": [...], "times": N, "dantuo": bool, "dan": [...], "tuo": [...]}
     
-    # 红球/蓝球开头关键字
-    red_start_patterns = [
-        re.compile(r"红球[:：]?\s*((?:\d{1,2}\s*)*)"),   # 红球: 或 红球
-        re.compile(r"红[:：]\s*((?:\d{1,2}\s*)*)"),     # 红: 或 红
-        re.compile(r"红胆[:：]\s*((?:\d{1,2}\s*)*)"),   # 红胆: 或 红胆
-    ]
+    def _is_red_keyword(line):
+        """检测行是否以红球/红胆/红拖等关键字开头，返回类型和同行数字
+        
+        注意：必须从最具体的关键字开始匹配，避免"红"先匹配了"红胆/红球/红拖"等
+        """
+        # 红球关键字变体（从最具体到最不具体排序）
+        red_keys = [
+            ("红球", False),   # 必须先于"红"
+            ("红胆", True),    # 胆码
+            ("红拖", False),   # 拖码
+            ("红爬", False),   # OCR误读
+            ("红皿", False),   # OCR误读
+            ("红昭", False),   # OCR误读
+            ("红粑", False),   # OCR误读
+            ("红", False),     # 兜底：单字红（必须带冒号以避免误匹配）
+        ]
+        for keyword, is_dan in red_keys:
+            if keyword == "红":
+                # 单字红必须带冒号，避免匹配"红胆"、"红球"等
+                pat = re.compile(r"红[:：]\s*((?:\d{1,2}\s*)*)")
+            else:
+                pat = re.compile(re.escape(keyword) + r"[:：]?\s*((?:\d{1,2}\s*)*)")
+            m = pat.match(line)
+            if m:
+                nums_text = m.group(1) if m.lastindex and m.lastindex >= 1 else ""
+                nums = extract_red_nums(nums_text)
+                return is_dan, nums
+        return None, []
     
-    blue_start_patterns = [
-        re.compile(r"蓝球[:：]?\s*((?:\d{1,2}\s*)*)"),   # 蓝球: 或 蓝球
-        re.compile(r"蓝[:：]\s*((?:\d{1,2}\s*)*)"),     # 蓝: 或 蓝
-        re.compile(r"蓝胆[:：]\s*((?:\d{1,2}\s*)*)"),   # 蓝胆: 或 蓝胆
-    ]
+    def _is_blue_keyword(line):
+        """检测行是否以蓝球关键字开头，返回同行数字
+        
+        注意：必须从最具体的关键字开始匹配
+        """
+        blue_keys = [
+            "蓝球", "蓝胆", "蓝琛", "蓝",
+        ]
+        for keyword in blue_keys:
+            if keyword == "蓝":
+                # 单字蓝必须带冒号
+                pat = re.compile(r"蓝[:：]\s*((?:\d{1,2}\s*)*)")
+            else:
+                pat = re.compile(re.escape(keyword) + r"[:：]?\s*((?:\d{1,2}\s*)*)")
+            m = pat.match(line)
+            if m:
+                nums_text = m.group(1) if m.lastindex and m.lastindex >= 1 else ""
+                nums = extract_blue_nums(nums_text)
+                return nums
+        # 兜底：匹配 "B球" 或 "球:" 开头（缺少"蓝"字的情况）
+        for pat_str in [r"[Bb]球[:：]?\s*((?:\d{1,2}\s*)*)",
+                        r"球[:：]\s*((?:\d{1,2}\s*)*)"]:
+            m = re.match(pat_str, line)
+            if m:
+                nums_text = m.group(1) if m.lastindex and m.lastindex >= 1 else ""
+                nums = extract_blue_nums(nums_text)
+                return nums
+        return []
     
-    # 倍数模式
-    times_pattern = re.compile(r"\[?(\d+)倍\]?")
+    def _save_current_red():
+        """将当前已读取的红球保存到等待队列（等待蓝球配对）"""
+        if in_dantuo_mode[0]:
+            total = len(current_red_dan[0]) + len(current_red_tuo[0])
+            if total >= 2:
+                pending_red_groups.append({
+                    "dantuo": True,
+                    "dan": list(current_red_dan[0]),
+                    "tuo": list(current_red_tuo[0]),
+                    "times": current_times[0]
+                })
+                # 重置红球相关状态
+                current_red_dan[0] = []
+                current_red_tuo[0] = []
+                in_dantuo_mode[0] = False
+                passed_tuo[0] = False
+                current_times[0] = 1
+                reading_red[0] = False
+        else:
+            if len(current_red[0]) >= 2:
+                pending_red_groups.append({
+                    "dantuo": False,
+                    "red": list(current_red[0]),
+                    "times": current_times[0]
+                })
+                current_red[0] = []
+                current_times[0] = 1
+                reading_red[0] = False
     
-    # 纯数字模式
-    pure_num_pattern = re.compile(r"^\s*(\d{1,2})\s*$")
+    def _try_finalize_with_blue():
+        """尝试用当前蓝球与等待队列中的红球配对"""
+        if pending_red_groups and len(current_blue[0]) >= 1:
+            # 取出最早等待的红球组
+            red_group = pending_red_groups.pop(0)
+            if red_group["dantuo"]:
+                merged = list(set(red_group["dan"] + red_group["tuo"]))
+                merged.sort()
+                if len(merged) >= 2:
+                    all_groups.append({
+                        "red": merged,
+                        "blue": sorted(current_blue[0]),
+                        "times": red_group["times"]
+                    })
+            else:
+                if len(red_group["red"]) >= 2:
+                    all_groups.append({
+                        "red": sorted(red_group["red"]),
+                        "blue": sorted(current_blue[0]),
+                        "times": red_group["times"]
+                    })
+            
+            # 如果还有等待的红球组，保留蓝球数据用于下一组
+            # 如果没有等待的红球组，才清空蓝球数据
+            if pending_red_groups:
+                # 还有红球等待配对，保留蓝球数据并清空reading状态
+                # 这样后续的蓝球数字可以继续添加
+                # 但需要重新开启读取模式
+                pass  # 保留current_blue，继续累加
+            else:
+                current_blue[0] = []
+                reading_blue[0] = False
     
+    def _finalize():
+        """完成当前分组（用于非队列模式或最后一组）"""
+        # 先尝试用队列模式处理所有能配对的组
+        while pending_red_groups and len(current_blue[0]) >= 1:
+            _try_finalize_with_blue()
+        
+        # 如果还有未配对的蓝球但没有更多红球等待，
+        # 将蓝球与最后一个current_red（如果有）配对
+        if pending_red_groups:
+            # 队列中还有未配对的红球，丢弃（没有蓝球）
+            # 但保留current_blue用于后续可能的红球
+            pass
+        
+        # 处理最后一组（如果有完整红蓝球）
+        if in_dantuo_mode[0]:
+            merged = list(set(current_red_dan[0] + current_red_tuo[0]))
+            merged.sort()
+            if len(merged) >= 2 and len(current_blue[0]) >= 1:
+                all_groups.append({
+                    "red": merged,
+                    "blue": sorted(current_blue[0]),
+                    "times": current_times[0]
+                })
+        else:
+            if len(current_red[0]) >= 2 and len(current_blue[0]) >= 1:
+                all_groups.append({
+                    "red": sorted(current_red[0]),
+                    "blue": sorted(current_blue[0]),
+                    "times": current_times[0]
+                })
+        
+        # 处理队列中剩余未配对的红球（没有蓝球，无法组成有效组）
+        pending_red_groups.clear()
+        
+        # 重置状态
+        current_red[0] = []
+        current_blue[0] = []
+        current_times[0] = 1
+        current_red_dan[0] = []
+        current_red_tuo[0] = []
+        in_dantuo_mode[0] = False
+        passed_tuo[0] = False
+        reading_red[0] = False
+        reading_blue[0] = False
+    
+    def _start_new_red(nums, is_dan):
+        """开始新的红球读取"""
+        if is_dan:
+            # 开始胆拖模式 - 红胆
+            in_dantuo_mode[0] = True
+            passed_tuo[0] = False
+            current_red_dan[0] = list(nums)
+            reading_red[0] = True
+            reading_blue[0] = False
+        elif in_dantuo_mode[0]:
+            # 胆拖模式下遇到新的红关键字（通常是"红拖"）
+            passed_tuo[0] = True
+            # 将数字加入拖码（如果同行有数字）
+            for n in nums:
+                if n not in current_red_tuo[0]:
+                    current_red_tuo[0].append(n)
+            reading_red[0] = True
+            reading_blue[0] = False
+        else:
+            # 普通模式
+            current_red[0] = list(nums)
+            reading_red[0] = True
+            reading_blue[0] = False
+    
+    def _add_red_nums(nums):
+        """添加红球号码到当前组"""
+        if in_dantuo_mode[0]:
+            if passed_tuo[0]:
+                # 已过"红拖"标记，加入拖码
+                for n in nums:
+                    if n not in current_red_tuo[0]:
+                        current_red_tuo[0].append(n)
+            else:
+                # 还在"红胆"阶段，加入胆码
+                for n in nums:
+                    if n not in current_red_dan[0]:
+                        current_red_dan[0].append(n)
+        else:
+            for n in nums:
+                if n not in current_red[0]:
+                    current_red[0].append(n)
+    
+    def _start_new_blue(nums):
+        """开始新的蓝球读取"""
+        # 保留已读取的红球数据
+        current_blue[0] = list(nums)
+        reading_blue[0] = True
+        reading_red[0] = False
+    
+    def _add_blue_nums(nums):
+        """添加蓝球号码到当前组"""
+        for n in nums:
+            if n not in current_blue[0]:
+                current_blue[0].append(n)
+    
+    # ====== 主解析循环 ======
     for line in lines:
         stripped = line.strip()
-        
-        # 检查是否是红球开头
-        is_red_start = False
-        for pattern in red_start_patterns:
-            match = pattern.match(stripped)
-            if match:
-                is_red_start = True
-                # 提取同行的数字
-                red_part = match.group(1) if match.lastindex and match.lastindex >= 1 else ""
-                nums = re.findall(r"\d{1,2}", red_part)
-                current_red = [int(n) for n in nums if 1 <= int(n) <= 33]
-                reading_red = True
-                reading_blue = False
-                break
-        
-        if is_red_start:
-            # 如果同行没有完整的红球列表，继续读取下一行
-            if len(current_red) < 2:
-                continue
-            # 否则完成红球读取
-            if reading_blue and len(current_blue) >= 1:
-                # 完成一组
-                all_groups.append({
-                    "red": sorted(current_red),
-                    "blue": sorted(current_blue),
-                    "times": current_times
-                })
-            current_red = []
-            current_blue = []
-            current_times = 1
-            reading_red = False
-            reading_blue = False
+        if not stripped:
             continue
         
-        # 检查是否是蓝球开头
-        is_blue_start = False
-        for pattern in blue_start_patterns:
-            match = pattern.match(stripped)
-            if match:
-                is_blue_start = True
-                # 先保存之前可能读取的红球
-                if len(current_red) >= 2:
-                    pass  # 保持当前红球
-                else:
-                    current_red = []
-                
-                # 提取同行的数字
-                blue_part = match.group(1) if match.lastindex and match.lastindex >= 1 else ""
-                nums = re.findall(r"\d{1,2}", blue_part)
-                current_blue = [int(n) for n in nums if 1 <= int(n) <= 16]
-                reading_blue = True
-                reading_red = False
-                break
-        
-        if is_blue_start:
-            if len(current_blue) >= 1 and reading_red == False:
-                # 如果已有红球，完成这组
-                if len(current_red) >= 2:
-                    all_groups.append({
-                        "red": sorted(current_red),
-                        "blue": sorted(current_blue),
-                        "times": current_times
-                    })
-                    current_red = []
-                    current_blue = []
-                    current_times = 1
+        # 0. 检查是否是倍数行
+        t = extract_times(stripped)
+        if t is not None:
+            current_times[0] = t
+            # 尝试用队列方式完成配对
+            if pending_red_groups and len(current_blue[0]) >= 1:
+                _try_finalize_with_blue()
+            # 同时检查当前直接模式
+            if in_dantuo_mode[0]:
+                total_red = len(current_red_dan[0]) + len(current_red_tuo[0])
+                if total_red >= 2 and len(current_blue[0]) >= 1:
+                    _finalize()
+            elif len(current_red[0]) >= 2 and len(current_blue[0]) >= 1:
+                _finalize()
             continue
         
-        # 检查是否是倍数行
-        times_match = times_pattern.match(stripped)
-        if times_match:
-            try:
-                current_times = int(times_match.group(1))
-            except:
-                current_times = 1
+        # 1. 检查是否是红球/红胆/红拖等开头
+        is_dan, red_nums = _is_red_keyword(stripped)
+        if is_dan is not None:
+            # 如果已有红球队列或当前红球，先保存
+            # 但在胆拖模式下遇到"红拖"时，不保存（只是胆拖内的状态转换）
+            is_red_tuo_transition = (in_dantuo_mode[0] and not is_dan)
+            if not is_red_tuo_transition:
+                if in_dantuo_mode[0] or len(current_red[0]) >= 2:
+                    _save_current_red()
+                # 如果有蓝球等待配对，也尝试完成
+                if len(current_blue[0]) >= 1:
+                    _try_finalize_with_blue()
             
-            # 如果已有红球和蓝球，完成这组
-            if len(current_red) >= 2 and len(current_blue) >= 1:
-                all_groups.append({
-                    "red": sorted(current_red),
-                    "blue": sorted(current_blue),
-                    "times": current_times
-                })
-                current_red = []
-                current_blue = []
-                current_times = 1
-                reading_red = False
-                reading_blue = False
+            _start_new_red(red_nums, is_dan)
+            
+            # 如果同行有足够号码，继续读下一行
+            if in_dantuo_mode[0]:
+                total = len(current_red_dan[0]) + len(current_red_tuo[0])
+                if total >= 2:
+                    continue
+            else:
+                if len(current_red[0]) >= 2:
+                    continue
             continue
         
-        # 检查是否是纯数字行（可能是延续的红球或蓝球）
-        num_match = pure_num_pattern.match(stripped)
+        # 2. 检查是否是蓝球开头
+        blue_nums = _is_blue_keyword(stripped)
+        if blue_nums:
+            # 先把已有的红球保存到等待队列
+            if in_dantuo_mode[0] or len(current_red[0]) >= 2:
+                _save_current_red()
+            
+            _start_new_blue(blue_nums)
+            # 立即尝试用蓝球与等待队列配对
+            if pending_red_groups and len(current_blue[0]) >= 1:
+                _try_finalize_with_blue()
+            if len(current_blue[0]) >= 1:
+                continue
+            continue
+        
+        # 3. 检查是否是纯数字行（延续的号码）
+        num_match = re.match(r"^\s*(\d{1,2})\s*$", stripped)
         if num_match:
             num = int(num_match.group(1))
-            
-            if reading_red and 1 <= num <= 33:
-                # 正在读取红球
-                if num not in current_red:
-                    current_red.append(num)
-            elif reading_blue and 1 <= num <= 16:
-                # 正在读取蓝球
-                if num not in current_blue:
-                    current_blue.append(num)
+            if reading_red[0]:
+                if 1 <= num <= 33:
+                    _add_red_nums([num])
+            elif reading_blue[0]:
+                if 1 <= num <= 16:
+                    _add_blue_nums([num])
+            continue
+        
+        # 4. 正在读取红球/蓝球时，从包含数字的行提取号码
+        if reading_red[0] and re.search(r"\d", stripped):
+            digit_count = len(re.findall(r"\d", stripped))
+            alpha_count = len(re.findall(r"[a-zA-Z\u4e00-\u9fff]", stripped))
+            if digit_count >= 1 and alpha_count <= 3:
+                nums = extract_red_nums(stripped)
+                if nums:
+                    _add_red_nums(nums)
+        elif reading_blue[0] and re.search(r"\d", stripped):
+            digit_count = len(re.findall(r"\d", stripped))
+            alpha_count = len(re.findall(r"[a-zA-Z\u4e00-\u9fff]", stripped))
+            if digit_count >= 1 and alpha_count <= 3:
+                nums = extract_blue_nums(stripped)
+                if nums:
+                    _add_blue_nums(nums)
     
     # 处理最后一组
-    if len(current_red) >= 2 and len(current_blue) >= 1:
-        all_groups.append({
-            "red": sorted(current_red),
-            "blue": sorted(current_blue),
-            "times": current_times
-        })
+    _finalize()
     
     if debug:
         print(f"  解析到 {len(all_groups)} 组复式")
