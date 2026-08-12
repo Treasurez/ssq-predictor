@@ -2,17 +2,35 @@
 # -*- coding: utf-8 -*-
 """
 双色球组合评分优化流水线 - 集成入口
-串联：统计评分(ml_score) → 遗传算法(ga_optimize) → LLM终评(llm_analyze) → 综合报告
+串联：[自动刷新] → 统计评分(ml_score) → 遗传算法(ga_optimize) → LLM终评(llm_analyze) → 综合报告
+
+【默认行为】
+  ① 自动刷新（调用 gen_probability + gen_combinations → 生成当天 txt）
+  ② 统计评分
+  ③ GA 优化
+  ④ LLM 阶段：默认跳过（无需 API Key 也能跑）
+
+【默认自动刷新】
+  每次运行会自动调用:
+    1) gen_probability.main() → 生成 双色球号码出现概率_YYYYMMDD.txt
+    2) gen_combinations.main() → 生成 双色球组合_出席率排序_YYYYMMDD.txt
+  保证 txt 报告用的是当天最新 xlsx（避免手动跑漏步骤）
 
 用法：
-  # 完整流程（含 LLM）
-  python scripts/predict_combo.py --model deepseek --api-key YOUR_KEY
+  # 默认最简：自动刷新 + 统计评分 + GA（无需 API Key）
+  python scripts/predict_combo.py
 
-  # 仅统计评分 + GA（无 LLM，无需 API Key）
-  python scripts/predict_combo.py --ga-only
+  # 完整流程：自动刷新 + 统计评分 + GA + LLM（需 API Key）
+  python scripts/predict_combo.py --llm --model deepseek --api-key YOUR_KEY
 
-  # 仅统计评分（无 GA、无 LLM）
-  python scripts/predict_combo.py --no-ga --ga-only
+  # 仅统计评分（跳过 GA、跳过 LLM）
+  python scripts/predict_combo.py --no-ga
+
+  # 跳过自动刷新（数据已存在时提速）
+  python scripts/predict_combo.py --no-refresh
+
+  # 最简全部跳过（只用已有 txt 跑统计评分）
+  python scripts/predict_combo.py --no-refresh --no-ga
 """
 # 必须在所有其他 import 之前抑制警告，防止 numpy/requests 间接导入 urllib3 时触发
 import warnings
@@ -166,24 +184,63 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  %(prog)s --ga-only                    # 统计评分 + GA（无需 API Key）
-  %(prog)s --model deepseek             # 完整流程（需 DEEPSEEK_API_KEY）
-  %(prog)s --model deepseek --api-key X # 完整流程（指定 Key）
-  %(prog)s --no-ga --ga-only            # 仅统计评分
+  %(prog)s                           # 默认：自动刷新 + 统计 + GA（无需 Key）
+  %(prog)s --llm --model deepseek    # 完整流程：+LLM（需 DEEPSEEK_API_KEY）
+  %(prog)s --llm --model deepseek --api-key X  # 完整流程（指定 Key）
+  %(prog)s --no-ga                   # 只跑：自动刷新 + 统计评分（跳过 GA+LLM）
+  %(prog)s --no-refresh              # 跳过自动刷新（数据已存在时提速）
+  %(prog)s --no-refresh --no-ga      # 最简：只用已有 txt 跑统计评分
         """,
     )
+    parser.add_argument("--llm", action="store_true",
+                        help="启用 LLM 终评阶段（默认关闭，启用需配 API Key）")
     parser.add_argument("--model", default="deepseek",
                         choices=["openai", "anthropic", "qwen", "deepseek", "zhipu"],
                         help="LLM 平台（默认 deepseek）")
     parser.add_argument("--api-key", help="API 密钥（优先使用环境变量）")
     parser.add_argument("--base-url", help="自定义 API URL")
     parser.add_argument("--top-n", type=int, default=100, help="统计评分输出 Top N（默认 100）")
-    parser.add_argument("--ga-only", action="store_true", help="跳过 LLM 阶段")
-    parser.add_argument("--no-ga", action="store_true", help="跳过 GA 阶段")
+    parser.add_argument("--no-ga", action="store_true", help="跳过 GA 阶段（也自然跳过 LLM）")
     parser.add_argument("--output", help="输出文件路径（默认自动生成）")
+    parser.add_argument("--no-refresh", action="store_true",
+                        help="跳过自动刷新（默认自动刷新 gen_probability 和 gen_combinations）")
     args = parser.parse_args()
 
     start_time = time.time()
+
+    # ==================== 第零步：自动刷新衍生报告 ====================
+    # 保证 combo 出席率 txt 和 概率统计 txt 用的是当天最新 xlsx，避免手动跑漏步骤
+    if not args.no_refresh:
+        print_banner("第零步：自动刷新衍生报告（xlsx → txt）")
+        print("  自动调用 gen_probability.main() → 概率统计 txt")
+        print("  自动调用 gen_combinations.main() → 组合出席率 txt")
+        print("  如要跳过，请加 --no-refresh 参数")
+        print()
+
+        import gen_probability
+        import gen_combinations
+
+        # 重定向两个 main() 的打印前缀，让日志层次更清晰
+        print("─" * 40 + " gen_probability " + "─" * 40)
+        try:
+            # gen_probability.main() 内有大量 print，为避免重复打印"已输出"这里不额外 catch
+            gen_probability.main()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  ⚠ gen_probability.main() 报错: {e}")
+            print("  继续执行（如数据文件实际已存在可继续）")
+        print()
+
+        print("─" * 40 + " gen_combinations " + "─" * 40)
+        try:
+            gen_combinations.main()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  ⚠ gen_combinations.main() 报错: {e}")
+            print("  继续执行（如数据文件实际已存在可继续）")
+        print()
 
     # ==================== 第一步：加载数据 ====================
     print_banner("第一步：加载历史数据与候选组合")
@@ -259,8 +316,8 @@ def main():
     # ==================== 第四步：LLM 终评 ====================
     print_banner("第四步：LLM 终评分析")
 
-    if args.ga_only:
-        print("  已跳过（--ga-only 模式）")
+    if not args.llm:
+        print("  已跳过（默认关闭，需传 --llm 启用；--no-ga 模式下也无 GA 候选可送 LLM）")
         # 降级报告
         from llm_analyze import _fallback_report
         llm_report = _fallback_report(scored, ga_top)

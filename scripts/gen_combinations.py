@@ -48,6 +48,11 @@ INJECTED_MARKER = -1
 # 让 "5 热 1 冷" / "4 热 2 冷" 的混合结构能在 Top 推荐中占据合理比例
 COLD_BALANCE_BONUS = 0.15
 
+# 红球遗漏分析参数
+# 红球共 33 个，每期开 6 个，理论出现率 6/33 = 18.2%，平均遗漏约 5.5 期
+RED_GAP_LONG = 15      # 长期遗漏阈值（≥15 期视为"待回补"，约 3 倍平均遗漏）
+RED_GAP_BONUS = 0.10   # 含 1-2 个长期遗漏红球的加分（与冷号平衡叠加）
+
 
 # ===================== 1. 读取复式数据 =====================
 def load_groups():
@@ -86,6 +91,31 @@ def load_history():
         blue = int(item["blue_ball"])
         history_set.add((red, blue))
     return history_set, len(data)
+
+
+def calc_red_gaps():
+    """计算每个红球的遗漏期数（截至最新一期多少期没开）
+
+    红球理论出现率 6/33 = 18.2%，平均遗漏约 5.5 期。
+    遗漏 ≥ RED_GAP_LONG(15) 期视为"长期遗漏待回补"。
+
+    Returns:
+        dict[int, int]: 红球号码(1-33) → 遗漏期数
+    """
+    with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.sort(key=lambda x: x["issue"])  # 按期号排序（旧→新）
+
+    gaps = {}
+    for r in range(1, 34):
+        gap = 0
+        for item in reversed(data):
+            reds = set(int(x) for x in item["red_balls"])
+            if r in reds:
+                break
+            gap += 1
+        gaps[r] = gap
+    return gaps
 
 
 # ===================== 3. 统计号码出席率 =====================
@@ -283,6 +313,13 @@ def main():
     print(f"  温号({WARM_THRESHOLD*100:.0f}-{HOT_THRESHOLD*100:.0f}%): {' '.join(f'{r:02d}' for r in sorted(warm_set))}")
     print(f"  冷号(<{WARM_THRESHOLD*100:.0f}%): {' '.join(f'{r:02d}' for r in sorted(cold_set))}")
 
+    # --- 红球遗漏分析 ---
+    red_gaps = calc_red_gaps()
+    long_gap_reds = {r for r, g in red_gaps.items() if g >= RED_GAP_LONG}
+    print(f"\n红球遗漏分析:")
+    print(f"  长期遗漏(≥{RED_GAP_LONG}期)待回补: {' '.join(f'{r:02d}({g}期)' for r, g in sorted(red_gaps.items()) if g >= RED_GAP_LONG) if long_gap_reds else '无'}")
+    print(f"  遗漏加分: 含 1-2 个长期遗漏红球 +{RED_GAP_BONUS:.2f}")
+
     # --- 冷号注入：从 Top 热温组合生成含冷号的变体 ---
     before_inject = len(unique_combos)
     injected_count = inject_cold_combinations(
@@ -293,9 +330,11 @@ def main():
     print(f"  注入组合: {injected_count} 组 (上限 {COLD_INJECT_MAX})")
     print(f"  总有效组合: {before_inject} → {len(unique_combos)} 组")
 
-    # --- 排序：出席率(支持组数)降序 → 号码热度+冷号平衡加分降序 → 蓝球热度 → 组合本身 ---
+    # --- 排序：出席率(支持组数)降序 → 号码热度+冷号平衡+红球遗漏加分降序 → 蓝球热度 → 组合本身 ---
     # 冷号平衡：1-2 个冷号的组合获得 COLD_BALANCE_BONUS 加分
-    # 让 "5 热 1 冷" / "4 热 2 冷" 的混合结构能在 Top 推荐中占据合理比例
+    #   让 "5 热 1 冷" / "4 热 2 冷" 的混合结构能在 Top 推荐中占据合理比例
+    # 红球遗漏：1-2 个长期遗漏红球的组合获得 RED_GAP_BONUS 加分
+    #   让含"待回补"红球的组合获得额外提升（基于历史开奖规律，非复式人气）
     def combo_score(item):
         combo, supporters = item
         red_fs, blue = combo
@@ -307,6 +346,10 @@ def main():
         cold_count = len(red_fs & cold_set)
         if 1 <= cold_count <= 2:
             avg_score += COLD_BALANCE_BONUS
+        # 红球遗漏加分：1-2 个长期遗漏红球 +bonus，0 个或 3+ 个不加分
+        long_gap_count = sum(1 for r in red_fs if red_gaps.get(r, 0) >= RED_GAP_LONG)
+        if 1 <= long_gap_count <= 2:
+            avg_score += RED_GAP_BONUS
         return (-len(supporters), -avg_score, -blue_score, sorted(red_fs))
 
     sorted_combos = sorted(unique_combos.items(), key=combo_score)
@@ -340,6 +383,24 @@ def main():
     lines.append(f"  注：冷号平衡加分 +{COLD_BALANCE_BONUS:.2f} 给含 1-2 个冷号的组合")
     lines.append("")
 
+    # --- 红球遗漏分析 ---
+    lines.append("─" * 70)
+    lines.append("【红球遗漏分析】（基于历史开奖 3488 期）")
+    lines.append("─" * 70)
+    lines.append(f"  理论出现率: 6/33 = 18.2%，平均遗漏约 5.5 期")
+    lines.append(f"  长期遗漏阈值: ≥{RED_GAP_LONG} 期（约 3 倍平均遗漏）")
+    lines.append(f"  遗漏加分: 含 1-2 个长期遗漏红球 +{RED_GAP_BONUS:.2f}（与冷号平衡叠加）")
+    lines.append(f"  长期待回补: {' '.join(f'{r:02d}({red_gaps[r]}期)' for r in sorted(long_gap_reds)) if long_gap_reds else '无'}")
+    lines.append("")
+    lines.append(f"  红球遗漏期数表（按遗漏期数降序）:")
+    for r in sorted(range(1, 34), key=lambda x: -red_gaps[x]):
+        gap = red_gaps[r]
+        bar_len = min(int(gap / 2), 25)
+        bar = "▁" * bar_len
+        tag = " ←长期遗漏" if gap >= RED_GAP_LONG else ""
+        lines.append(f"    {r:02d}: 遗漏 {gap:3d} 期 {bar}{tag}")
+    lines.append("")
+
     # --- 红球出席率 ---
     lines.append("─" * 70)
     lines.append("【红球出席率】（在多少组复式中出现）")
@@ -369,6 +430,7 @@ def main():
     lines.append("  号码热度 = 6个红球+1蓝球的平均出席率")
     lines.append("  结构   = 热号数/温号数/冷号数（基于红球）")
     lines.append("  [注入] = 算法派生的冷号变体（非复式直接展开）")
+    lines.append("  遗漏   = 组合中含长期遗漏(≥{}期)红球及期数".format(RED_GAP_LONG))
     lines.append("─" * 70)
     lines.append("")
 
@@ -394,6 +456,10 @@ def main():
         c = len(red_fs & cold_set)
         structure = f"{h}热{w}温{c}冷"
 
+        # 长期遗漏红球标注
+        gap_reds_in_combo = [(r, red_gaps[r]) for r in red_sorted if red_gaps.get(r, 0) >= RED_GAP_LONG]
+        gap_str = " ".join(f"{r:02d}({g}期)" for r, g in gap_reds_in_combo) if gap_reds_in_combo else "-"
+
         # 来源标注：注入组合 vs 复式展开
         is_injected = INJECTED_MARKER in supporters
         if is_injected:
@@ -416,6 +482,7 @@ def main():
             f"| 出席率: {support_count}/{total_groups} = {attendance_pct:5.1f}%  "
             f"| 热度: {avg_hot:5.1f}%  "
             f"| 结构: {structure}  "
+            f"| 遗漏: {gap_str}  "
             f"| 来源: {source_tag}"
         )
 
@@ -435,9 +502,11 @@ def main():
     # 统计 Top 100 冷热结构分布
     top100 = sorted_combos[:100]
     top100_with_cold = sum(1 for c, _ in top100 if len(c[0] & cold_set) > 0)
+    top100_with_gap = sum(1 for c, _ in top100 if any(red_gaps.get(r, 0) >= RED_GAP_LONG for r in c[0]))
     top100_injected = sum(1 for _, s in top100 if INJECTED_MARKER in s)
     print(f"\n  Top 100 冷热结构:")
     print(f"    含冷号组合: {top100_with_cold} 个 ({top100_with_cold}%)")
+    print(f"    含长期遗漏红球组合: {top100_with_gap} 个 ({top100_with_gap}%)")
     print(f"    算法注入组合: {top100_injected} 个")
 
     # 打印前20条预览
@@ -456,11 +525,13 @@ def main():
         h = len(red_fs & hot_set)
         w = len(red_fs & warm_set)
         c = len(red_fs & cold_set)
+        gap_reds = [f"{r:02d}({red_gaps[r]}期)" for r in red_sorted if red_gaps.get(r, 0) >= RED_GAP_LONG]
+        gap_tag = f" | 遗漏:{' '.join(gap_reds)}" if gap_reds else ""
         tag = " [注入]" if INJECTED_MARKER in supporters else ""
         print(f"  #{rank:04d}  {red_str} + {blue:02d}  "
               f"| 出席率: {support_count}/{total_groups}={attendance_pct:.1f}%  "
               f"| 热度: {avg_hot:.1f}%  "
-              f"| 结构: {h}热{w}温{c}冷{tag}")
+              f"| 结构: {h}热{w}温{c}冷{gap_tag}{tag}")
 
 
 if __name__ == "__main__":
