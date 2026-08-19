@@ -1209,23 +1209,80 @@ def spatial_grouping(items, debug=False):
 
 
 # ===================== 3.9 网格图片裁剪策略（多彩票拼图专用） =====================
-def _detect_grid_layout(img):
-    """检测网格图片的行列数
+def _detect_red_banner_regions(img):
+    """检测图片顶部和底部的红色横幅区域，返回 (top_end, bottom_start)
 
-    策略：根据图片宽高比和尺寸估算常见布局（3列居多）
+    使用滑动窗口平均红色占比，避免文字区域导致检测中断。
+    返回中间彩票区域的Y范围 [top_end, bottom_start]
     """
     h, w = img.shape[:2]
-    # 列数：宽高比 > 1.2 通常3列，0.9~1.2 为2列，否则1列
-    if w / h > 1.2:
-        cols = 3
-    elif w / h > 0.9:
-        cols = 2
-    else:
-        cols = 1
-    # 行数：每张彩票高度约200-250px
-    rows = max(1, round(h / 230))
-    if cols == 3 and rows not in [2, 3, 4, 5]:
-        rows = 4
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # 检测红色像素（宽范围，覆盖暗红到亮红）
+    lower_red1 = np.array([0, 40, 40])
+    upper_red1 = np.array([20, 255, 255])
+    lower_red2 = np.array([160, 40, 40])
+    upper_red2 = np.array([180, 255, 255])
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, lower_red1, upper_red1),
+        cv2.inRange(hsv, lower_red2, upper_red2)
+    )
+
+    # 每行红色像素占比
+    red_ratio = np.sum(red_mask > 0, axis=1) / w
+
+    # 滑动窗口平均（窗口大小30）
+    window = 30
+    smoothed = np.convolve(red_ratio, np.ones(window)/window, mode='same')
+
+    # 顶部横幅：从顶部开始，找到滑动平均降到0.25以下的位置
+    top_end = 0
+    for y in range(window, h - window):
+        if smoothed[y] < 0.25:
+            top_end = y
+            break
+    if top_end == 0:
+        top_end = 0  # 没检测到横幅
+
+    # 底部横幅：从底部开始，找到滑动平均降到0.25以下的位置
+    bottom_start = h
+    for y in range(h - window - 1, window, -1):
+        if smoothed[y] < 0.25:
+            bottom_start = y
+            break
+    if bottom_start == h:
+        bottom_start = h
+
+    # 确保中间区域足够大（至少占图片40%）
+    if bottom_start - top_end < h * 0.4:
+        top_end = 0
+        bottom_start = h
+
+    return int(top_end), int(bottom_start)
+
+
+def _detect_grid_layout(img, top_offset=0, bottom_offset=None):
+    """检测网格图片的行列数
+
+    先去除顶部/底部红色横幅，再根据中间区域的宽高比和尺寸估算。
+    """
+    h, w = img.shape[:2]
+    if bottom_offset is None:
+        bottom_offset = h
+
+    region_h = bottom_offset - top_offset
+    region_w = w
+    ratio = region_w / region_h if region_h > 0 else 1
+
+    # 列数：大多数彩票拼图都是3列
+    cols = 3
+
+    # 行数：根据高度估算（每张彩票高度约200-240px）
+    rows = max(2, round(region_h / 220))
+
+    # 限制合理范围
+    rows = min(6, max(2, rows))
+
     return rows, cols
 
 
@@ -1277,7 +1334,7 @@ def _parse_sub_image_simple(sub_img, debug=False):
     variants = preprocess_images(sub_img)
     for variant in variants:
         name, img = variant
-        if name not in ("原图", "放大1.5x", "灰度图", "灰度+放大", "对比度增强"):
+        if name not in ("原图", "放大1.5x", "灰度图", "灰度+放大", "对比度增强", "二值化", "反色二值化", "自适应二值化"):
             continue
         try:
             results = reader.readtext(img, detail=1)
@@ -1320,7 +1377,7 @@ def _parse_sub_image_simple(sub_img, debug=False):
 
     # ===== 鲁棒Y分割：去掉极值后在中间区域找最大间隔 =====
     ys_sorted = sorted([d[1] for d in all_digits])
-    # 去掉最低和最高各15%的极值（顶部logo区和底部感谢区）
+    # 去掉最低和最高各15%的极值
     cut = int(len(ys_sorted) * 0.15)
     if cut > 0 and len(ys_sorted) > 2 * cut + 4:
         ys_trimmed = ys_sorted[cut:-cut]
@@ -1336,6 +1393,13 @@ def _parse_sub_image_simple(sub_img, debug=False):
             max_gap = gap
             split_y = (ys_trimmed[i] + ys_trimmed[i-1]) / 2
 
+    # 校验：分割后上下两侧数字都不能太少
+    red_count = sum(1 for d in all_digits if d[1] < split_y)
+    blue_count = sum(1 for d in all_digits if d[1] >= split_y)
+    if red_count < 3 or blue_count < 2:
+        # 分割不合理，用中位数分割
+        split_y = ys_sorted[len(ys_sorted)//2]
+
     # 上面红球，下面蓝球
     red_raw = [(n, y, p) for n, y, p in all_digits if y < split_y]
     blue_raw = [(n, y, p) for n, y, p in all_digits if y >= split_y]
@@ -1349,7 +1413,7 @@ def _parse_sub_image_simple(sub_img, debug=False):
     # 红球：优先取频次>=2的，限制6-8个
     red_by_freq = red_counter.most_common()
     red_high = [num for num, cnt in red_by_freq if cnt >= 2]
-    if len(red_high) >= 6:
+    if len(red_high) >= 5:
         red_selected = sorted(set(red_high[:8]))
     else:
         red_selected = sorted(set([num for num, _ in red_by_freq[:8]]))
@@ -1367,7 +1431,8 @@ def _parse_sub_image_simple(sub_img, debug=False):
     if overlap:
         blue_selected = [b for b in blue_selected if b not in overlap]
 
-    if len(red_selected) < 3 or len(blue_selected) < 1:
+    # 降低阈值：红球>=1即可输出（避免子图因OCR质量差而完全失败）
+    if len(red_selected) < 1 or len(blue_selected) < 1:
         if debug:
             print(f"    子图解析失败: split_y={split_y:.0f}, 红候选={red_counter.most_common(8)}, 蓝候选={blue_counter.most_common(5)}")
         return None
@@ -1384,28 +1449,39 @@ def _parse_sub_image_simple(sub_img, debug=False):
 def _parse_grid_image(img, debug=False):
     """将网格图片裁剪成单张彩票子图，逐张识别后合并
 
-    避免多张彩票拼在一起时，不同彩票的号码互相干扰、空间分组错乱。
-    使用 _parse_sub_image_simple 简单解析每个子图，每图只输出1组。
+    步骤：
+    1. 检测并去除顶部/底部红色横幅
+    2. 在中间彩票区域检测网格行列数
+    3. 裁剪成子图，逐张用简单法解析，失败则回退
     """
     import tempfile
     h, w = img.shape[:2]
-    rows, cols = _detect_grid_layout(img)
-    if debug:
-        print(f"  [网格裁剪] 检测到 {rows}行 x {cols}列 = {rows*cols} 张彩票")
 
-    cell_w = w / cols
-    cell_h = h / rows
-    margin = 6  # 裁剪边距，避免包含相邻彩票边缘
+    # 1. 检测红色横幅，裁剪中间彩票区域
+    top_end, bottom_start = _detect_red_banner_regions(img)
+    if debug:
+        print(f"  [网格裁剪] 红色横幅: 顶部[0,{top_end}], 底部[{bottom_start},{h}]")
+    work_img = img[top_end:bottom_start, :]
+    wh, ww = work_img.shape[:2]
+
+    # 2. 检测网格布局
+    rows, cols = _detect_grid_layout(work_img)
+    if debug:
+        print(f"  [网格裁剪] 中间区域 {ww}x{wh}, 检测到 {rows}行 x {cols}列 = {rows*cols} 张彩票")
+
+    cell_w = ww / cols
+    cell_h = wh / rows
+    margin = 6  # 裁剪边距
 
     all_groups = []
     for r in range(rows):
         for c in range(cols):
             x1 = max(0, int(c * cell_w) + margin)
             y1 = max(0, int(r * cell_h) + margin)
-            x2 = min(w, int((c + 1) * cell_w) - margin)
-            y2 = min(h, int((r + 1) * cell_h) - margin)
-            sub_img = img[y1:y2, x1:x2]
-            if sub_img.size == 0:
+            x2 = min(ww, int((c + 1) * cell_w) - margin)
+            y2 = min(wh, int((r + 1) * cell_h) - margin)
+            sub_img = work_img[y1:y2, x1:x2]
+            if sub_img.size == 0 or sub_img.shape[0] < 50 or sub_img.shape[1] < 50:
                 continue
             # 先用简单频次统计法解析
             g = _parse_sub_image_simple(sub_img, debug=debug)
@@ -1414,9 +1490,8 @@ def _parse_grid_image(img, debug=False):
                 if debug:
                     print(f"    子图[{r},{c}] 简单法: 红={g['red']} 蓝={g['blue']}")
             else:
-                # 简单法失败，回退到原有多策略合并逻辑
-                import tempfile
-                tmp_path = os.path.join(tempfile.gettempdir(), f"ssq_sub_fallback_{r}_{c}.png")
+                # 失败回退到原有多策略逻辑
+                tmp_path = os.path.join(tempfile.gettempdir(), f"ssq_sub_fb_{r}_{c}.png")
                 cv2.imwrite(tmp_path, sub_img)
                 fallback = parse_lottery_image(tmp_path, debug=False, _is_sub=True)
                 try:
@@ -1424,7 +1499,6 @@ def _parse_grid_image(img, debug=False):
                 except Exception:
                     pass
                 if fallback:
-                    # 回退结果可能有多组，取红球最多的一组
                     best = max(fallback, key=lambda x: len(x.get("red", [])))
                     all_groups.append(best)
                     if debug:
@@ -2642,11 +2716,11 @@ def export_to_excel(all_groups, save_name=None):
 # ===================== 主程序入口 =====================
 if __name__ == "__main__":
     # # 普通运行
-    # python3 scripts/lottery1.py
+    # python3 scripts/lottery.py
     # # 调试模式（查看详细 OCR 识别结果）
-    # python3 scripts/lottery1.py --debug
+    # python3 scripts/lottery.py --debug
     # # 指定图片目录
-    # python3 scripts/lottery1.py --folder ./your_images
+    # python3 scripts/lottery.py --folder ./your_images
     # 检查是否启用调试模式
     import argparse
     parser = argparse.ArgumentParser(description='双色球图片OCR识别')
@@ -2662,9 +2736,9 @@ if __name__ == "__main__":
 
     # 3. 导出全部号码到Excel
     export_to_excel(all_lottery_groups)
-
+    print("---------------end")
     # 4. 计算冷热号频次
-    red_hot_sort, blue_hot_sort = calc_hot_cold(all_lottery_groups)
+    # red_hot_sort, blue_hot_sort = calc_hot_cold(all_lottery_groups)
 
     # 5. 输出热度并生成推荐号码池
-    red_pool, blue_pool = get_recommend(red_hot_sort, blue_hot_sort)
+    # red_pool, blue_pool = get_recommend(red_hot_sort, blue_hot_sort)
