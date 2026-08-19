@@ -4,7 +4,7 @@
 确保路径/文件名一致，避免散落的硬编码。
 
 文件名规则：
-  - 彩票图片 OCR 汇总 xlsx（生成端：lottery.py / lottery_sim.py）
+  - 彩票图片 OCR 汇总 xlsx（生成端：lottery1.py / lottery_sim.py）
       命名: 双色球全部号码汇总_YYYYMMDD.xlsx   (在 PROJECT_ROOT 下)
   - 消费端（gen_combinations.py / gen_probability.py / gen_lottery_txt.py）
       自动读取 PROJECT_ROOT 下"日期戳最新"的汇总 xlsx，无需手动改名
@@ -34,7 +34,7 @@ LLM_DIR = os.path.join(SCRIPTS_DIR, "llm")
 DATE_STAMP = datetime.now().strftime('%Y%m%d')
 
 
-# ===================== 1. OCR 汇总 xlsx（lottery.py / lottery_sim.py 生成）=====================
+# ===================== 1. OCR 汇总 xlsx（lottery1.py / lottery_sim.py 生成）=====================
 # 生成端写入用的文件名（带当天日期）
 LOTTERY_SUMMARY_XLSX = f'双色球全部号码汇总_{DATE_STAMP}.xlsx'
 LOTTERY_SUMMARY_PATH = os.path.join(PROJECT_ROOT, LOTTERY_SUMMARY_XLSX)
@@ -79,7 +79,7 @@ def get_summary_xlsx_or_exit():
     if not path:
         import sys
         print("错误：找不到任何双色球汇总 xlsx 文件。")
-        print("  请先运行 lottery.py 或 lottery_sim.py 生成 OCR 汇总。")
+        print("  请先运行 lottery1.py 或 lottery_sim.py 生成 OCR 汇总。")
         print(f"  查找范围（新格式）: {PROJECT_ROOT}/双色球全部号码汇总_*.xlsx")
         print(f"  查找范围（旧格式）: {PROJECT_ROOT}/双色球汇总.xlsx 或 {SCRIPTS_DIR}/双色球汇总.xlsx")
         sys.exit(1)
