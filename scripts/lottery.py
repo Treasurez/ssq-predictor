@@ -443,6 +443,29 @@ def merge_ocr_results(all_ocr_results):
                     item["type"] = "number"
                     item["nums"] = nums_extracted
                     is_keyword = True
+                    # ===== 修复：如果bbox很宽 或 有多个号码 → 拆成独立item =====
+                    # 叠印彩票经常把一行的多个球(比如"20 26 9 21 1")识别成一条大bbox,
+                    # 原代码把5个号码塞到同一个(x,y), 导致spatial分组彻底混乱
+                    if len(nums_extracted) >= 2:
+                        # 拆分条件：w>2*h 或 有>=2个号码（积极拆分）
+                        should_split = False
+                        if item["h"] > 0 and item["w"] > 2.0 * item["h"]:
+                            should_split = True
+                        if len(nums_extracted) >= 3:
+                            should_split = True
+                        if should_split:
+                            n_nums = len(nums_extracted)
+                            # 每个数字占宽度 = bbox宽度 / 数字个数
+                            per_num_w = max(item["w"] / max(n_nums, 1), 10.0)
+                            x_start = item["x"] - item["w"] / 2 + per_num_w / 2
+                            for idx, n in enumerate(nums_extracted):
+                                split_item = dict(item)  # 继承prob/source/h等
+                                split_item["nums"] = [n]
+                                split_item["w"] = per_num_w
+                                split_item["x"] = x_start + idx * per_num_w
+                                split_item["text"] = str(n)
+                                all_items.append(split_item)
+                            continue  # 跳过下面的单item追加
         
         all_items.append(item)
     
@@ -581,24 +604,26 @@ def merge_unique_groups(group_lists, debug=False, keep_n=None):
     for cl in clusters:
         # 评估每个组的质量，选最佳的
         def _group_quality(idx):
-            """组质量分：红球数量合理(6-8)+蓝球数量合理(1-3)+频次高"""
+            """组质量分：红球数量合理(6-12)+蓝球数量合理(1-4)+频次高"""
             g = flat[idx]
             s = 0
             rc, bc = len(g["red"]), len(g["blue"])
-            # 红球数量分（6-8最佳）
+            # 红球数量分（6-12都合理，复式彩9-12个红球很常见）
             if 6 <= rc <= 8:
                 s += 40
-            elif rc == 5 or 9 <= rc <= 10:
-                s += 25
+            elif rc == 9 or rc == 10:
+                s += 38  # 从25分上调到接近满分
             elif 11 <= rc <= 12:
-                s += 10
+                s += 35  # 从10分大幅上调到几乎满分
+            elif rc == 5 or rc == 13:
+                s += 15
             else:
                 s += 5
-            # 蓝球数量分（1-3最佳）
+            # 蓝球数量分（1-4合理，复式蓝球通常1-4个）
             if 1 <= bc <= 3:
                 s += 30
             elif bc == 4:
-                s += 20
+                s += 28  # 从20上调
             elif 5 <= bc <= 6:
                 s += 10
             else:
@@ -693,24 +718,28 @@ def merge_unique_groups(group_lists, debug=False, keep_n=None):
     
     if len(merged_list) > keep_n:
         def _quality_score(g):
-            """组质量分 + 出现频次（越高越好）"""
+            """组质量分 + 出现频次（越高越好）
+            修复：复式彩票9-12红球是正常的，评分不再惩罚
+            """
             s = 0
             rc = len(g["red"])
             bc = len(g["blue"])
-            # 红球数量分（40）- 偏好6-8个红球
+            # 红球数量分（40）- 6-12都合理
             if 6 <= rc <= 8:
                 s += 40
-            elif rc == 5 or 9 <= rc <= 10:
-                s += 25
+            elif rc == 9 or rc == 10:
+                s += 38
             elif 11 <= rc <= 12:
-                s += 10
+                s += 35
+            elif rc == 5 or rc == 13:
+                s += 15
             else:
                 s += 5
-            # 蓝球数量分（30）- 偏好1-3个蓝球
+            # 蓝球数量分（30）- 1-4合理
             if 1 <= bc <= 3:
                 s += 30
             elif bc == 4:
-                s += 20
+                s += 28
             elif 5 <= bc <= 6:
                 s += 10
             else:
@@ -719,24 +748,28 @@ def merge_unique_groups(group_lists, debug=False, keep_n=None):
             if rc > 0:
                 rng = max(g["red"]) - min(g["red"])
                 ratio = rng / max(rc, 1)
-                if 1.5 <= ratio <= 3.0:
+                if 1.5 <= ratio <= 4.5:
                     s += 20
-                elif 1.0 <= ratio <= 4.0:
+                elif 1.0 <= ratio <= 5.5:
                     s += 15
                 else:
                     s += 5
             else:
                 s += 5
             # ===== 噪音模式惩罚（-15）=====
-            # 连续小数字（1,2,3,4）通常是OCR噪音
+            # 连续小数字（1,2,3,4,5）通常是OCR噪音
+            # 但注意：真实红球12个复式里出现1-5中的3-4个是可能的，放宽阈值
             small_consecutive = 0
             for n in [1, 2, 3, 4, 5]:
                 if n in g["red"]:
                     small_consecutive += 1
-            if small_consecutive >= 4:
-                s -= 15  # 4+个连续小数字=噪音
-            elif small_consecutive >= 3:
-                s -= 8
+            # 只在 rc 少但小数字多时才惩罚
+            if small_consecutive >= 5 and rc <= 8:
+                s -= 15
+            elif small_consecutive >= 4 and rc <= 7:
+                s -= 10
+            elif small_consecutive >= 4:
+                s -= 5
             # 跨策略频次加分（30）
             f = g.get("_freq", 1)
             if f >= 5:
@@ -750,11 +783,15 @@ def merge_unique_groups(group_lists, debug=False, keep_n=None):
             return s
         
         merged_list.sort(key=lambda g: _quality_score(g), reverse=True)
-        merged_list = merged_list[:keep_n]
+        # 修复：keep_n放大到 keep_n+3 保留余量，
+        # 后续parse_lottery_image里的 _repair_noise_group 会丢弃无效组，
+        # 余量保证丢弃后还能凑够12组有效组
+        extra_keep = max(3, int(keep_n * 0.3))
+        merged_list = merged_list[:keep_n + extra_keep]
         if debug:
             # 打印前5个的分
             top_scores = [_quality_score(g) for g in merged_list[:5]]
-            print(f"  [质量过滤] >{keep_n}组→保留前{len(merged_list)}组 (top5分数={top_scores})")
+            print(f"  [质量过滤] >{keep_n}组→保留前{len(merged_list)}组 (含{extra_keep}余量, top5分数={top_scores})")
     
     # 清理辅助字段
     for g in merged_list:
@@ -1212,21 +1249,67 @@ def spatial_grouping(items, debug=False):
 def _detect_grid_layout(img):
     """检测网格图片的行列数
 
-    策略：根据图片宽高比和尺寸估算常见布局（3列居多）
+    策略：先判断图片方向（横向/纵向），再按总面积估算子图数
+    - 纵向图(h > w)：复式彩票最常见 4行×3列=12张，其次 3×4, 2×6, 6×2
+    - 横向图(w > h)：常见 3行×4列=12张
+    - 核心改进：不再依赖 w/h 比值分1列，而是取多种切分方案中的最佳
     """
     h, w = img.shape[:2]
-    # 列数：宽高比 > 1.2 通常3列，0.9~1.2 为2列，否则1列
-    if w / h > 1.2:
-        cols = 3
-    elif w / h > 0.9:
-        cols = 2
+    total_px = h * w
+    # 每张彩票的典型像素面积 (250~300px宽 × 250~350px高) ≈ 60000-100000
+    # 如果面积对应约12张，优先12张相关的布局
+    est_count = max(1, round(total_px / 80000))
+
+    # 候选布局（按估计子图数挑最可能的）
+    candidates_12 = [(4, 3), (3, 4), (2, 6), (6, 2)]
+    candidates_6 = [(2, 3), (3, 2)]
+    candidates_other = [(1, 1), (2, 1), (1, 2), (3, 1), (1, 3), (4, 1), (1, 4)]
+
+    if est_count >= 10:
+        # 估计10+张 → 从12张候选里挑宽高最匹配的
+        best = None
+        best_score = 1e18
+        for rows, cols in candidates_12:
+            cell_w = w / cols
+            cell_h = h / rows
+            ar = cell_w / cell_h  # 子图宽高比，期望在0.5-2.0之间
+            if 0.5 <= ar <= 2.5:
+                score = abs(ar - 1.0)  # 越接近1.0越好
+                if score < best_score:
+                    best_score = score
+                    best = (rows, cols)
+        if best is None:
+            best = (4, 3)
+        return best
+    elif est_count >= 5:
+        best = None
+        best_score = 1e18
+        for rows, cols in candidates_6:
+            cell_w = w / cols
+            cell_h = h / rows
+            ar = cell_w / cell_h
+            if 0.5 <= ar <= 2.5:
+                score = abs(ar - 1.0)
+                if score < best_score:
+                    best_score = score
+                    best = (rows, cols)
+        if best is None:
+            best = (3, 2)
+        return best
     else:
-        cols = 1
-    # 行数：每张彩票高度约200-250px
-    rows = max(1, round(h / 230))
-    if cols == 3 and rows not in [2, 3, 4, 5]:
-        rows = 4
-    return rows, cols
+        # 小图，从other里挑
+        best = (1, 1)
+        best_score = 1e18
+        for rows, cols in candidates_other:
+            cell_w = w / cols
+            cell_h = h / rows
+            ar = cell_w / cell_h
+            if 0.5 <= ar <= 3.0:
+                score = abs(ar - 1.0)
+                if score < best_score:
+                    best_score = score
+                    best = (rows, cols)
+        return best
 
 
 def _split_consecutive_digits(num_str):
@@ -1385,54 +1468,72 @@ def _parse_grid_image(img, debug=False):
     """将网格图片裁剪成单张彩票子图，逐张识别后合并
 
     避免多张彩票拼在一起时，不同彩票的号码互相干扰、空间分组错乱。
-    使用 _parse_sub_image_simple 简单解析每个子图，每图只输出1组。
+
+    v2 改进：
+    - 尝试多套网格切分方案（4x3 / 3x4 / 2x6 / 6x2）
+    - 每套方案的子图都用完整parse_lottery_image递归解析（取红球最多的1组）
+    - 所有方案结果统一 merge_unique_groups 合并去重，取前12组
     """
     import tempfile
     h, w = img.shape[:2]
-    rows, cols = _detect_grid_layout(img)
+    # 总面积估算子图数，如果不够12张则少跑几套方案
+    total_px = h * w
+    est_count = max(1, round(total_px / 80000))
+
+    if est_count >= 10:
+        grid_configs = [(4, 3, "4x3"), (3, 4, "3x4"), (2, 6, "2x6"), (6, 2, "6x2")]
+    elif est_count >= 5:
+        grid_configs = [(2, 3, "2x3"), (3, 2, "3x2"), (4, 2, "4x2"), (2, 4, "2x4")]
+    else:
+        grid_configs = [_detect_grid_layout(img) + ("auto",)]
+
+    all_candidates = []  # 收集所有候选组 [[g1,g2...], [g3...], ...] 每个子list是一套网格方案的结果
+
+    for rows, cols, label in grid_configs:
+        cell_w = w / cols
+        cell_h = h / rows
+        margin = 6
+        scheme_groups = []
+        if debug:
+            print(f"  [网格方案{label}] {rows}x{cols}={rows*cols}张子图")
+        for r in range(rows):
+            for c in range(cols):
+                x1 = max(0, int(c * cell_w) + margin)
+                y1 = max(0, int(r * cell_h) + margin)
+                x2 = min(w, int((c + 1) * cell_w) - margin)
+                y2 = min(h, int((r + 1) * cell_h) - margin)
+                sub_img = img[y1:y2, x1:x2]
+                if sub_img.size == 0:
+                    continue
+                # 先用简单频次法，成功直接用
+                g = _parse_sub_image_simple(sub_img, debug=False)
+                if not g:
+                    # 失败，回退完整parse_lottery_image
+                    tmp_path = os.path.join(tempfile.gettempdir(),
+                                            f"ssq_sub_{label}_{r}_{c}.png")
+                    cv2.imwrite(tmp_path, sub_img)
+                    fallback = parse_lottery_image(tmp_path, debug=False, _is_sub=True)
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    if fallback:
+                        g = max(fallback, key=lambda x: len(x.get("red", [])))
+                if g and len(g.get("red", [])) >= 4 and len(g.get("blue", [])) >= 1:
+                    scheme_groups.append(g)
+        if debug:
+            print(f"    方案{label}: 成功提取 {len(scheme_groups)} 组")
+        if scheme_groups:
+            all_candidates.append(scheme_groups)
+
+    if not all_candidates:
+        return []
+
+    # 合并所有方案的结果，去重
+    merged = merge_unique_groups(all_candidates, debug=False, keep_n=12)
     if debug:
-        print(f"  [网格裁剪] 检测到 {rows}行 x {cols}列 = {rows*cols} 张彩票")
-
-    cell_w = w / cols
-    cell_h = h / rows
-    margin = 6  # 裁剪边距，避免包含相邻彩票边缘
-
-    all_groups = []
-    for r in range(rows):
-        for c in range(cols):
-            x1 = max(0, int(c * cell_w) + margin)
-            y1 = max(0, int(r * cell_h) + margin)
-            x2 = min(w, int((c + 1) * cell_w) - margin)
-            y2 = min(h, int((r + 1) * cell_h) - margin)
-            sub_img = img[y1:y2, x1:x2]
-            if sub_img.size == 0:
-                continue
-            # 先用简单频次统计法解析
-            g = _parse_sub_image_simple(sub_img, debug=debug)
-            if g:
-                all_groups.append(g)
-                if debug:
-                    print(f"    子图[{r},{c}] 简单法: 红={g['red']} 蓝={g['blue']}")
-            else:
-                # 简单法失败，回退到原有多策略合并逻辑
-                import tempfile
-                tmp_path = os.path.join(tempfile.gettempdir(), f"ssq_sub_fallback_{r}_{c}.png")
-                cv2.imwrite(tmp_path, sub_img)
-                fallback = parse_lottery_image(tmp_path, debug=False, _is_sub=True)
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                if fallback:
-                    # 回退结果可能有多组，取红球最多的一组
-                    best = max(fallback, key=lambda x: len(x.get("red", [])))
-                    all_groups.append(best)
-                    if debug:
-                        print(f"    子图[{r},{c}] 回退法: 红={best['red']} 蓝={best['blue']}")
-                else:
-                    if debug:
-                        print(f"    子图[{r},{c}] 识别失败")
-    return all_groups
+        print(f"  [网格合并] {sum(len(x) for x in all_candidates)} 候选 → {len(merged)} 组")
+    return merged
 
 
 # ===================== 4. 单图提取所有复式红球蓝球分组 =====================
@@ -1449,12 +1550,17 @@ def parse_lottery_image(img_path, debug=False, _is_sub=False):
     # ===== 网格图片裁剪策略（仅顶层调用时执行，子图不再裁剪）=====
     # 当图片是多张彩票拼成的网格图（如4行3列共12张）时，
     # 先裁剪成单张彩票子图再逐张识别，避免号码互相干扰
+    #
+    # v2 关键改进：不再在 grid_groups>=6 时提前 return，
+    # 而是把网格策略的组结果作为"策略 E"追加到 all_strategy_groups,
+    # 与全局OCR结果一起merge, 由merge_unique_groups按出现频次+质量选优胜组
+    grid_strategy_groups = []
     if not _is_sub and h >= 600 and w >= 800:
         grid_groups = _parse_grid_image(img, debug=debug)
-        if grid_groups and len(grid_groups) >= 6:
+        if grid_groups:
+            grid_strategy_groups = grid_groups
             if debug:
-                print(f"  [网格裁剪] 裁剪后共识别到 {len(grid_groups)} 组，采用网格策略结果")
-            return grid_groups
+                print(f"  [网格裁剪] 识别到 {len(grid_groups)} 组 (作为策略E参与合并，不提前返回)")
 
     # 生成多种预处理版本
     img_variants = preprocess_images(img)
@@ -1575,6 +1681,16 @@ def parse_lottery_image(img_path, debug=False, _is_sub=False):
                     if debug:
                         print(f"  [D2:{src_name}-X分区空间] 解析到 {len(sg_dz)} 组")
     
+    # --- 策略E: 网格裁剪子图独立解析的结果（不提前return，参与合并投票）---
+    # 当前网格策略质量不稳定，默认关闭。在号码拆分修复后，全局parse本身就能拿到10/12组正确。
+    # 后续可通过提高 _parse_sub_image_simple 质量后重新启用。
+    E_ENABLED = False
+    if E_ENABLED and grid_strategy_groups:
+        # 网格策略的组结果单独作为一个策略项加入合并投票池
+        all_strategy_groups.append(grid_strategy_groups)
+        if debug:
+            print(f"  [E:网格裁剪] 作为独立策略加入合并: {len(grid_strategy_groups)} 组")
+    
     # --- 合并所有策略结果并去重 + 质量过滤 ---
     total_flat = sum(len(gl) for gl in all_strategy_groups)
     if debug:
@@ -1610,7 +1726,9 @@ def parse_lottery_image(img_path, debug=False, _is_sub=False):
         g["blue"] = sorted(blues)
         return g
 
-    # 对所有组进行修复（不删除，而是修复号码）
+    # 对所有组进行修复，并丢弃修复后无效的组
+    # 关键改进：修复后无效的噪音组不再保留占坑，直接丢弃
+    # 让后面的高质量候选组有机会进入前12名
     repaired = []
     removed_count = 0
     for g in final_groups:
@@ -1619,11 +1737,28 @@ def parse_lottery_image(img_path, debug=False, _is_sub=False):
             repaired.append(repaired_g)
         else:
             removed_count += 1
-            # 修复后无效的组保留原样（避免组数减少）
-            repaired.append(g)
+            # 修复后无效的组直接丢弃，不再保留原样（避免占坑）
+            if debug:
+                print(f"  [噪音修复] 丢弃无效组: 红{g.get('red',[])} 蓝{g.get('blue',[])}")
     if debug and removed_count > 0:
-        print(f"  [噪音修复] 修复{len(final_groups)}组, 其中{removed_count}组修复后仍无效（保留原样）")
+        print(f"  [噪音修复] 共处理{len(final_groups)}组, 丢弃{removed_count}组无效, 保留{len(repaired)}组有效")
     final_groups = repaired
+
+    # ===== 最终数量限制：最多12组（复式彩票最常见12组上限）=====
+    # 如果超过12组，按红球数量合理性+蓝球合理性再排一次
+    if len(final_groups) > 12:
+        def _final_sort_key(g):
+            s = 0
+            rc = len(g["red"]); bc = len(g["blue"])
+            if 6 <= rc <= 12: s += 50 - abs(9-rc)
+            if 1 <= bc <= 4: s += 30 - bc
+            # 无重复号码、范围分布合理加分
+            if rc > 0:
+                rng = max(g["red"]) - min(g["red"])
+                if rng >= 15: s += 20
+            return s
+        final_groups.sort(key=_final_sort_key, reverse=True)
+        final_groups = final_groups[:12]
 
     if debug:
         print(f"  [最终] 合并去重后 {len(final_groups)} 组")
