@@ -3,7 +3,7 @@ import cv2
 import re
 import os
 import sys
-from collections import defaultdict
+from collections import defaultdict, Counter
 import numpy as np
 import pandas as pd
 
@@ -507,7 +507,7 @@ def merge_unique_groups(group_lists, debug=False, keep_n=None):
     freq_map = {}   # red_tuple -> 出现的策略索引数（计数）
     for gi, gl in enumerate(group_lists):
         for g in gl:
-            if not (6 <= len(g.get("red", [])) <= 30 and 1 <= len(g.get("blue", [])) <= 16):
+            if not (5 <= len(g.get("red", [])) <= 30 and 1 <= len(g.get("blue", [])) <= 16):
                 continue
             rk = tuple(sorted(g["red"]))
             if rk in freq_map:
@@ -1339,15 +1339,17 @@ def _split_consecutive_digits(num_str):
 
 
 def _parse_sub_image_simple(sub_img, debug=False):
-    """专门处理裁剪后的单张彩票子图：Y直方图峰值检测分红球/蓝球行
+    """专门处理裁剪后的彩票子图：单票解析器
 
-    策略：
-    1. 收集所有数字（含连写拆分）
-    2. Y方向直方图找两个密度峰值（红球行、蓝球行）
-    3. 两峰之间最低点为分割线
-    4. 频次统计提取号码
+    v3 改进：
+    - 简化解析逻辑，专注于单票场景
+    - 频次统计去噪：跨OCR变体统计每个数字的出现频次
+    - 空间位置辅助红蓝分离：红球在上/中区域，蓝球在下区域
+    - 智能数量约束：红球6-8个，蓝球2-3个
+
+    返回: None (失败) 或 dict {"red": [...], "blue": [...]}
     """
-    from collections import Counter
+    from collections import Counter, defaultdict
 
     h, w = sub_img.shape[:2]
 
@@ -1355,8 +1357,12 @@ def _parse_sub_image_simple(sub_img, debug=False):
     times_sub_re = re.compile(r'\[?\d+\s*[倍份服股倚伯侪倌倩宿佾伤府佰]\]?')
     bracket_num_re = re.compile(r'\[\d+[^\]]*\]')
 
-    # 收集所有数字：(num, y, prob)
+    # 收集所有数字：(num, y, x, prob)
     all_digits = []
+    num_freq = Counter()
+    num_y_positions = defaultdict(list)
+    num_x_positions = defaultdict(list)
+
     variants = preprocess_images(sub_img)
     for variant in variants:
         name, img = variant
@@ -1372,14 +1378,14 @@ def _parse_sub_image_simple(sub_img, debug=False):
                 continue
             if _is_noise_ocr_text(text):
                 continue
-            if prob < 0.30:
+            if prob < 0.20:
                 continue
             clean_text = times_sub_re.sub(' ', text)
             clean_text = bracket_num_re.sub(' ', clean_text)
             xs = [p[0] for p in bbox]
             ys = [p[1] for p in bbox]
-            cy = sum(ys)/len(ys)/scale
-            # 提取数字：先尝试连写拆分，再提取独立1-2位数字
+            cy = sum(ys) / len(ys) / scale
+            cx = sum(xs) / len(xs) / scale
             for match in re.finditer(r'\d+', clean_text):
                 digit_str = match.group()
                 if len(digit_str) <= 2:
@@ -1390,27 +1396,311 @@ def _parse_sub_image_simple(sub_img, debug=False):
                             if (1 <= rev <= 33) and not (1 <= n <= 33):
                                 n = rev
                         if 1 <= n <= 33:
-                            all_digits.append((n, cy, prob))
+                            all_digits.append((n, cy, cx, prob))
+                            num_freq[n] += 1
+                            num_y_positions[n].append(cy)
+                            num_x_positions[n].append(cx)
                     except Exception:
                         pass
                 else:
-                    # 连写多位数字，拆分
                     for n in _split_consecutive_digits(digit_str):
-                        all_digits.append((n, cy, prob))
+                        if 1 <= n <= 33:
+                            all_digits.append((n, cy, cx, prob))
+                            num_freq[n] += 1
+                            num_y_positions[n].append(cy)
+                            num_x_positions[n].append(cx)
+
+    if len(all_digits) < 4:
+        return None
+
+    # ===== 频次滤波 =====
+    min_freq = 2
+    high_freq_nums = {n for n, f in num_freq.items() if f >= min_freq}
+    if len(high_freq_nums) < 6:
+        min_freq = 1
+        high_freq_nums = {n for n, f in num_freq.items() if f >= min_freq}
+
+    filtered_digits = [(n, y, x, p) for n, y, x, p in all_digits if n in high_freq_nums]
+
+    if len(filtered_digits) < 4:
+        filtered_digits = all_digits
+
+    if len(filtered_digits) < 4:
+        return None
+
+    # ===== 统计每个数字的频次和位置 =====
+    digit_info = {}  # num -> {"freq": int, "avg_y": float, "avg_x": float, "positions": [(y,x)]}
+    for n, y, x, p in filtered_digits:
+        if n not in digit_info:
+            digit_info[n] = {"freq": 0, "ys": [], "xs": []}
+        digit_info[n]["freq"] += 1
+        digit_info[n]["ys"].append(y)
+        digit_info[n]["xs"].append(x)
+
+    # 计算每个数字的平均位置
+    for n in digit_info:
+        info = digit_info[n]
+        info["avg_y"] = sum(info["ys"]) / len(info["ys"])
+        info["avg_x"] = sum(info["xs"]) / len(info["xs"])
+
+    # ===== 分离红球和蓝球候选 =====
+    # 红球候选: 1-33范围的数字（但1-16也可能是红球）
+    # 蓝球候选: 1-16范围的数字
+    red_range_nums = {n for n in digit_info if 1 <= n <= 33}
+    blue_range_nums = {n for n in digit_info if 1 <= n <= 16}
+
+    if len(red_range_nums) < 5:
+        return None
+
+    # ===== 策略1: 基于Y位置分离 =====
+    # 红球在上/中区域，蓝球在下区域
+    avg_ys = [info["avg_y"] for info in digit_info.values()]
+    if avg_ys:
+        # 找到Y位置的分割点（蓝球通常在底部）
+        sorted_ys = sorted(set([int(y) for y in avg_ys]))
+        if len(sorted_ys) >= 2:
+            # 尝试在不同位置分割
+            best_split_y = None
+            best_score = -1
+
+            for split_y in sorted_ys:
+                top_nums = {n for n, info in digit_info.items() if info["avg_y"] <= split_y}
+                bottom_nums = {n for n, info in digit_info.items() if info["avg_y"] > split_y}
+
+                # 顶部应该主要包含红球
+                red_in_top = top_nums & red_range_nums
+                # 底部可能包含蓝球
+                blue_in_bottom = bottom_nums & blue_range_nums
+                blue_in_top = top_nums & blue_range_nums
+
+                # 评分：顶部红球多且蓝球少，底部蓝球多
+                if len(red_in_top) >= 5 and len(blue_in_bottom) >= 1:
+                    score = len(red_in_top) * 2 + len(blue_in_bottom) - len(blue_in_top) * 0.5
+                    if score > best_score:
+                        best_score = score
+                        best_split_y = split_y
+
+            if best_split_y is not None:
+                # 使用最佳分割点
+                red_candidates = []
+                blue_candidates = []
+
+                for n, info in digit_info.items():
+                    if 1 <= n <= 33:
+                        if info["avg_y"] <= best_split_y:
+                            red_candidates.append((n, info["freq"], info["avg_y"]))
+                        elif 1 <= n <= 16:
+                            # Y位置偏下的小数字作为蓝球候选
+                            blue_candidates.append((n, info["freq"], info["avg_y"]))
+
+                # 红球也可能出现在底部（少数情况）
+                # 如果红球候选不够，从底部补充
+                if len(red_candidates) < 6:
+                    for n, info in digit_info.items():
+                        if 17 <= n <= 33 and (n, info["freq"], info["avg_y"]) not in red_candidates:
+                            red_candidates.append((n, info["freq"], info["avg_y"]))
+
+                # 蓝球候选：从底部的1-16范围数字中选择
+                if len(blue_candidates) < 2:
+                    for n, info in digit_info.items():
+                        if 1 <= n <= 16 and (n, info["freq"], info["avg_y"]) not in blue_candidates:
+                            blue_candidates.append((n, info["freq"], info["avg_y"]))
+
+                if debug:
+                    print(f"    Y分割@{best_split_y}: 红候选{len(red_candidates)}, 蓝候选{len(blue_candidates)}")
+
+                # 选择最终结果
+                red_selected = _select_red_balls(red_candidates, debug)
+                blue_selected = _select_blue_balls(blue_candidates, digit_info, debug)
+
+                if red_selected and blue_selected and len(red_selected) >= 5 and len(blue_selected) >= 2:
+                    # 检查重叠
+                    overlap = set(red_selected) & set(blue_selected)
+                    if overlap:
+                        blue_selected = [b for b in blue_selected if b not in overlap]
+
+                    if len(red_selected) >= 5 and len(blue_selected) >= 1:
+                        if debug:
+                            print(f"    → 成功: 红{sorted(red_selected)}, 蓝{sorted(blue_selected)}")
+                        return {"red": sorted(red_selected), "blue": sorted(blue_selected), "times": 1}
+
+    # ===== 策略2: 纯频次选择（回退）=====
+    # 红球：1-33中频次最高的6-8个
+    # 蓝球：1-16中频次最高的2-3个（但排除已选为红球的数字）
+
+    # 红球候选（按频次排序）
+    red_freq = [(n, info["freq"], info["avg_y"]) for n, info in digit_info.items() if 1 <= n <= 33]
+    red_freq.sort(key=lambda x: (-x[1], x[2]))  # 频次高优先，Y位置上优先
+
+    # 蓝球候选（按频次排序，且Y位置偏下）
+    blue_freq = [(n, info["freq"], info["avg_y"]) for n, info in digit_info.items() if 1 <= n <= 16]
+    blue_freq.sort(key=lambda x: (-x[1], -x[2]))  # 频次高优先，Y位置下优先
+
+    # 选择红球（6-8个）
+    red_selected = []
+    for n, f, y in red_freq:
+        if len(red_selected) >= 8:
+            break
+        if f >= 1:  # 频次>=1
+            red_selected.append(n)
+
+    if len(red_selected) < 5:
+        return None
+
+    # 选择蓝球（2-3个），排除已选为红球的
+    blue_selected = []
+    red_set = set(red_selected)
+    for n, f, y in blue_freq:
+        if len(blue_selected) >= 3:
+            break
+        if n not in red_set:
+            blue_selected.append(n)
+
+    if len(red_selected) >= 5 and len(blue_selected) >= 1:
+        if debug:
+            print(f"    → 频次回退: 红{sorted(red_selected)}, 蓝{sorted(blue_selected)}")
+        return {"red": sorted(red_selected), "blue": sorted(blue_selected), "times": 1}
+
+    return None
+
+
+def _select_red_balls(candidates, debug=False):
+    """从红球候选中选择最终红球（频次+位置加权）"""
+    if not candidates:
+        return None
+
+    # 按频次排序
+    candidates.sort(key=lambda x: (-x[1], x[2]))  # 频次高优先，Y位置上优先
+
+    # 选择6-8个
+    selected = []
+    for n, f, y in candidates:
+        if len(selected) >= 8:
+            break
+        if f >= 1:
+            selected.append(n)
+
+    if len(selected) >= 5:
+        return sorted(selected)
+    return sorted(selected) if selected else None
+
+
+def _select_blue_balls(candidates, digit_info, debug=False):
+    """从蓝球候选中选择最终蓝球（频次+位置加权）"""
+    if not candidates:
+        return None
+
+    # 按频次排序
+    candidates.sort(key=lambda x: (-x[1], -x[2]))  # 频次高优先，Y位置下优先
+
+    # 选择2-3个
+    selected = []
+    for n, f, y in candidates:
+        if len(selected) >= 4:
+            break
+        if f >= 1:
+            selected.append(n)
+
+    if len(selected) >= 1:
+        return sorted(selected)
+    return None
+
+
+def _extract_red_balls(cluster_digits, num_freq, debug=False):
+    """从红球行提取红球（频次加权选择）"""
+    from collections import Counter
+
+    # 仅保留1-33范围的数字
+    candidates = [(n, y, x, p) for n, y, x, p in cluster_digits if 1 <= n <= 33]
+    if not candidates:
+        return None
+
+    # 频次统计
+    freq_counter = Counter()
+    for n, y, x, p in candidates:
+        freq_counter[n] += num_freq.get(n, 1)  # 使用全局频次加权
+
+    # 优先选择频次高的数字
+    sorted_by_freq = sorted(freq_counter.items(), key=lambda x: x[1], reverse=True)
+
+    # 红球通常6-8个，取前8个
+    selected = [num for num, cnt in sorted_by_freq[:10]]
+
+    # 过滤：确保至少4个，最多8个
+    if len(selected) >= 4:
+        return sorted(set(selected[:8]))
+    return sorted(set(selected)) if selected else None
+
+
+def _extract_blue_balls(cluster_digits, num_freq, debug=False):
+    """从蓝球行提取蓝球（仅保留1-16范围）"""
+    from collections import Counter
+
+    candidates = [(n, y, x, p) for n, y, x, p in cluster_digits if 1 <= n <= 16]
+    if not candidates:
+        return None
+
+    # 频次统计
+    freq_counter = Counter()
+    for n, y, x, p in candidates:
+        freq_counter[n] += num_freq.get(n, 1)
+
+    sorted_by_freq = sorted(freq_counter.items(), key=lambda x: x[1], reverse=True)
+
+    # 蓝球通常2-3个，取前4个
+    selected = [num for num, cnt in sorted_by_freq[:5]]
+
+    if len(selected) >= 1:
+        return sorted(set(selected[:4]))
+    return None
+
+
+def _split_mixed_cluster(cluster_digits, num_freq, debug=False):
+    """处理混合行（同时含红球和蓝球）：按Y位置或数字范围分裂"""
+    if len(cluster_digits) < 4:
+        return None, None
+
+    # 按Y位置分割：上半部分为红球，下半部分为蓝球
+    cluster_sorted = sorted(cluster_digits, key=lambda d: d[1])
+    ys = [d[1] for d in cluster_sorted]
+
+    # 找最大Y间距
+    max_gap = 0
+    split_idx = len(cluster_sorted) // 2
+    for i in range(1, len(ys)):
+        gap = ys[i] - ys[i-1]
+        if gap > max_gap:
+            max_gap = gap
+            split_idx = i
+
+    red_part = cluster_sorted[:split_idx]
+    blue_part = cluster_sorted[split_idx:]
+
+    # 提取红球
+    red_selected = _extract_red_balls(red_part, num_freq, debug)
+    # 提取蓝球
+    blue_selected = _extract_blue_balls(blue_part, num_freq, debug)
+
+    # 如果蓝球部分没有蓝球范围数字，从所有数字中取1-16范围的
+    if not blue_selected:
+        all_blue = [(n, y, x, p) for n, y, x, p in cluster_sorted if 1 <= n <= 16]
+        if all_blue:
+            blue_selected = _extract_blue_balls(all_blue, num_freq, debug)
+
+    return red_selected, blue_selected
+
+
+def _fallback_y_split(all_digits, num_freq, debug=False):
+    """回退方案：简单Y分割（用于未能成功分类的情况）"""
+    from collections import Counter
 
     if len(all_digits) < 6:
         return None
 
-    # ===== 鲁棒Y分割：去掉极值后在中间区域找最大间隔 =====
     ys_sorted = sorted([d[1] for d in all_digits])
-    # 去掉最低和最高各15%的极值（顶部logo区和底部感谢区）
     cut = int(len(ys_sorted) * 0.15)
-    if cut > 0 and len(ys_sorted) > 2 * cut + 4:
-        ys_trimmed = ys_sorted[cut:-cut]
-    else:
-        ys_trimmed = ys_sorted
+    ys_trimmed = ys_sorted[cut:-cut] if cut > 0 and len(ys_sorted) > 2*cut+4 else ys_sorted
 
-    # 在修剪后的Y范围内找最大间隔
     max_gap = 0
     split_y = (ys_trimmed[0] + ys_trimmed[-1]) / 2
     for i in range(1, len(ys_trimmed)):
@@ -1419,64 +1709,433 @@ def _parse_sub_image_simple(sub_img, debug=False):
             max_gap = gap
             split_y = (ys_trimmed[i] + ys_trimmed[i-1]) / 2
 
-    # 上面红球，下面蓝球
-    red_raw = [(n, y, p) for n, y, p in all_digits if y < split_y]
-    blue_raw = [(n, y, p) for n, y, p in all_digits if y >= split_y]
+    red_raw = [d for d in all_digits if d[1] < split_y]
+    blue_raw = [d for d in all_digits if d[1] >= split_y]
 
     if not red_raw or not blue_raw:
         return None
 
-    red_counter = Counter(n for n, _, _ in red_raw)
-    blue_counter = Counter(n for n, _, _ in blue_raw if n <= 16)
+    red_selected = _extract_red_balls(red_raw, num_freq, debug)
+    blue_selected = _extract_blue_balls(blue_raw, num_freq, debug)
 
-    # 红球：优先取频次>=2的，限制6-8个
-    red_by_freq = red_counter.most_common()
-    red_high = [num for num, cnt in red_by_freq if cnt >= 2]
-    if len(red_high) >= 6:
-        red_selected = sorted(set(red_high[:8]))
-    else:
-        red_selected = sorted(set([num for num, _ in red_by_freq[:8]]))
-
-    # 蓝球：优先取频次>=2的，限制1-4个
-    blue_by_freq = [(num, cnt) for num, cnt in blue_counter.most_common() if num <= 16]
-    blue_high = [num for num, cnt in blue_by_freq if cnt >= 2]
-    if blue_high:
-        blue_selected = sorted(set(blue_high[:4]))
-    else:
-        blue_selected = sorted(set([num for num, _ in blue_by_freq[:4]]))
+    if not red_selected or not blue_selected:
+        return None
 
     # 交叉污染过滤
     overlap = set(red_selected) & set(blue_selected)
     if overlap:
         blue_selected = [b for b in blue_selected if b not in overlap]
 
-    if len(red_selected) < 3 or len(blue_selected) < 1:
-        if debug:
-            print(f"    子图解析失败: split_y={split_y:.0f}, 红候选={red_counter.most_common(8)}, 蓝候选={blue_counter.most_common(5)}")
+    if len(red_selected) < 4 or len(blue_selected) < 1:
+        return None
+
+    return {"red": sorted(red_selected), "blue": sorted(blue_selected), "times": 1}
+
+
+def _detect_dynamic_grid(img, debug=False):
+    """基于OCR密度动态检测彩票网格边界
+
+    通过分析数字在X/Y方向上的密度分布，找到实际的行/列分割线，
+    而不是使用固定的等宽等分。这对于边界不整齐的扫描图片更准确。
+
+    返回: [(x1, y1, x2, y2), ...] 每个cell的坐标列表
+    """
+    from collections import Counter, defaultdict
+
+    h, w = img.shape[:2]
+
+    # 运行OCR收集所有数字位置
+    all_digits = []
+    variants = preprocess_images(img)
+    for vname, variant in variants:
+        if vname not in ("原图", "放大1.5x", "灰度图", "灰度+放大", "对比度增强"):
+            continue
+        try:
+            results = reader.readtext(variant, detail=1)
+        except Exception:
+            continue
+        scale = 1.5 if "放大" in vname else 1.0
+        for bbox, text, prob in results:
+            if not text or not text.strip() or _is_noise_ocr_text(text) or prob < 0.25:
+                continue
+            clean_text = re.sub(r'\[?\d+\s*[倍份服股倚伯侪倌倩宿佾伤府佰]\]?', ' ', text)
+            clean_text = re.sub(r'\[\d+[^\]]*\]', ' ', clean_text)
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            cy = sum(ys) / len(ys) / scale
+            cx = sum(xs) / len(xs) / scale
+            for m in re.finditer(r'\d+', clean_text):
+                ds = m.group()
+                if len(ds) <= 2:
+                    try:
+                        n = int(ds)
+                        if 10 <= n <= 99:
+                            rev = int(str(n)[::-1])
+                            if (1 <= rev <= 33) and not (1 <= n <= 33):
+                                n = rev
+                        if 1 <= n <= 33:
+                            all_digits.append((n, cy, cx, prob))
+                    except Exception:
+                        pass
+
+    if len(all_digits) < 10:
+        # 数字太少，回退到固定网格
+        return None
+
+    # ===== 检测Y方向行边界 =====
+    # 平滑密度
+    y_density = []
+    y_step = 5
+    for y in range(0, h, y_step):
+        count = sum(1 for n, dy, dx, dp in all_digits if abs(dy - y) <= 25)
+        y_density.append((y, count))
+
+    # 找密度峰值（行）
+    y_threshold = max(8, len(all_digits) // 10)
+    y_peaks = []
+    in_peak = False
+    peak_start = 0
+    for y, count in y_density:
+        if count >= y_threshold and not in_peak:
+            in_peak = True
+            peak_start = y
+        elif count < y_threshold and in_peak:
+            in_peak = False
+            y_peaks.append((peak_start, y))
+    if in_peak:
+        y_peaks.append((peak_start, y_density[-1][0]))
+
+    if len(y_peaks) < 2:
+        return None
+
+    # 合并太近的Y峰（<80px apart）
+    merged_y_peaks = []
+    for start, end in y_peaks:
+        if merged_y_peaks and start - merged_y_peaks[-1][1] < 80:
+            merged_y_peaks[-1] = (merged_y_peaks[-1][0], end)
+        else:
+            merged_y_peaks.append((start, end))
+
+    # ===== 检测X方向列边界 =====
+    x_density = []
+    for x in range(0, w, y_step):
+        count = sum(1 for n, dy, dx, dp in all_digits if abs(dx - x) <= 30)
+        x_density.append((x, count))
+
+    x_threshold = max(8, len(all_digits) // 10)
+    x_peaks = []
+    in_peak = False
+    peak_start = 0
+    for x, count in x_density:
+        if count >= x_threshold and not in_peak:
+            in_peak = True
+            peak_start = x
+        elif count < x_threshold and in_peak:
+            in_peak = False
+            x_peaks.append((peak_start, x))
+    if in_peak:
+        x_peaks.append((peak_start, x_density[-1][0]))
+
+    if len(x_peaks) < 2:
+        return None
+
+    # 合并太近的X峰（<120px apart）- 增大阈值避免过度分裂
+    merged_x_peaks = []
+    for start, end in x_peaks:
+        if merged_x_peaks and start - merged_x_peaks[-1][1] < 120:
+            merged_x_peaks[-1] = (merged_x_peaks[-1][0], end)
+        else:
+            merged_x_peaks.append((start, end))
+
+    if len(merged_x_peaks) < 2 or len(merged_y_peaks) < 2:
         return None
 
     if debug:
-        print(f"    子图解析: split_y={split_y:.0f}")
-        print(f"             红球候选={red_counter.most_common(10)}")
-        print(f"             蓝球候选={blue_counter.most_common(5)}")
-        print(f"             最终: 红={red_selected} 蓝={blue_selected}")
+        print(f"  [动态网格] 检测到 {len(merged_y_peaks)} 行, {len(merged_x_peaks)} 列")
+        for i, (s, e) in enumerate(merged_y_peaks):
+            center = (s + e) // 2
+            row_nums = [n for n, dy, dx, dp in all_digits if s - 20 <= dy <= e + 20]
+            print(f"    行{i}: Y=[{s},{e}] 中心={center}px, {len(row_nums)}个检测")
+        for i, (s, e) in enumerate(merged_x_peaks):
+            center = (s + e) // 2
+            col_nums = [n for n, dy, dx, dp in all_digits if s - 20 <= dx <= e + 20]
+            print(f"    列{i}: X=[{s},{e}] 中心={center}px, {len(col_nums)}个检测")
 
-    return {"red": red_selected, "blue": blue_selected, "times": 1}
+    # ===== 生成cell边界 =====
+    # 在peak之间添加分割线
+    # 从第一行的起始位置开始，到最后一行的结束位置结束
+    y_separators = [merged_y_peaks[0][0]]  # 从第一行开始
+    for i in range(len(merged_y_peaks) - 1):
+        gap_start = merged_y_peaks[i][1]
+        gap_end = merged_y_peaks[i + 1][0]
+        sep_y = (gap_start + gap_end) // 2
+        y_separators.append(sep_y)
+    y_separators.append(merged_y_peaks[-1][1])  # 到最后一行结束
+
+    x_separators = [merged_x_peaks[0][0]]  # 从第一列开始
+    for i in range(len(merged_x_peaks) - 1):
+        gap_start = merged_x_peaks[i][1]
+        gap_end = merged_x_peaks[i + 1][0]
+        sep_x = (gap_start + gap_end) // 2
+        x_separators.append(sep_x)
+    x_separators.append(merged_x_peaks[-1][1])  # 到最后一列结束
+
+    # 生成cells
+    cells = []
+    for r in range(len(y_separators) - 1):
+        y1 = y_separators[r]
+        y2 = y_separators[r + 1]
+        # 只保留有足够数字的行
+        row_nums = [n for n, dy, dx, dp in all_digits if y1 <= dy <= y2]
+        if len(row_nums) < 5:
+            continue
+        for c in range(len(x_separators) - 1):
+            x1 = x_separators[c]
+            x2 = x_separators[c + 1]
+            col_nums = [n for n, dy, dx, dp in all_digits if x1 <= dx <= x2 and y1 <= dy <= y2]
+            # 即使cell数字很少也保留（可能是边缘cell）
+            cells.append((x1, y1, x2, y2))
+
+    if debug:
+        print(f"  [动态网格] 生成 {len(cells)} 个cell")
+
+    return cells
 
 
 def _parse_grid_image(img, debug=False):
     """将网格图片裁剪成单张彩票子图，逐张识别后合并
 
-    避免多张彩票拼在一起时，不同彩票的号码互相干扰、空间分组错乱。
-
-    v2 改进：
-    - 尝试多套网格切分方案（4x3 / 3x4 / 2x6 / 6x2）
-    - 每套方案的子图都用完整parse_lottery_image递归解析（取红球最多的1组）
-    - 所有方案结果统一 merge_unique_groups 合并去重，取前12组
+    v4 改进：
+    - 优先使用动态网格检测（基于OCR密度）
+    - 对每个cell，使用全局OCR数据（避免裁剪导致的OCR质量下降）
+    - 使用空间分组逻辑进行红蓝分离
+    - 动态和固定网格结果都参与合并
     """
     import tempfile
     h, w = img.shape[:2]
-    # 总面积估算子图数，如果不够12张则少跑几套方案
+    all_candidates = []
+
+    # ===== 先在全图上运行OCR并收集带位置的数字 =====
+    global_digits = []  # [(num, y, x, freq), ...]
+    global_num_freq = Counter()
+    global_num_positions = defaultdict(list)
+    
+    variants = preprocess_images(img)
+    for vname, variant in variants:
+        if vname not in ("原图", "放大1.5x", "灰度图", "灰度+放大", "对比度增强"):
+            continue
+        try:
+            results = reader.readtext(variant, detail=1)
+        except Exception:
+            continue
+        scale = 1.5 if "放大" in vname else 1.0
+        for bbox, text, prob in results:
+            if not text or not text.strip() or _is_noise_ocr_text(text) or prob < 0.20:
+                continue
+            clean_text = re.sub(r'\[?\d+\s*[倍份服股倚伯侪倌倩宿佾伤府佰]\]?', ' ', text)
+            clean_text = re.sub(r'\[\d+[^\]]*\]', ' ', clean_text)
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            cy = sum(ys) / len(ys) / scale
+            cx = sum(xs) / len(xs) / scale
+            for m in re.finditer(r'\d+', clean_text):
+                ds = m.group()
+                if len(ds) <= 2:
+                    try:
+                        n = int(ds)
+                        if 10 <= n <= 99:
+                            rev = int(str(n)[::-1])
+                            if (1 <= rev <= 33) and not (1 <= n <= 33):
+                                n = rev
+                        if 1 <= n <= 33:
+                            global_digits.append((n, cy, cx, prob))
+                            global_num_freq[n] += 1
+                            global_num_positions[n].append((cy, cx))
+                    except Exception:
+                        pass
+
+    if len(global_digits) < 10:
+        return []
+
+    # ===== 尝试动态网格检测 =====
+    dynamic_cells = _detect_dynamic_grid(img, debug=debug)
+
+    # ===== 定义解析函数：从cell边界内的数字生成彩票组 =====
+    def _parse_cell_digits(x1, y1, x2, y2):
+        """从全局OCR数据中筛选cell内的数字，解析为彩票组
+
+        v5 改进（单票cell模型）：
+        - 每个cell包含一张彩票（可能有叠印但不影响结构）
+        - 先用gap-based方法去除Y方向离群点（来自相邻cell的叠印干扰）
+        - 再用Y位置将数字分为上部(红球)和下部(蓝球)
+        - 频次过滤去除噪音
+        """
+        margin = 2
+        sx1, sy1 = x1 + margin, y1 + margin
+        sx2, sy2 = x2 - margin, y2 - margin
+
+        # 筛选cell内的数字
+        cell_digits = []
+        for n, cy, cx, prob in global_digits:
+            if sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
+                cell_digits.append((n, cy, cx))
+
+        if len(cell_digits) < 5:
+            return None
+
+        # 统计频次
+        cell_freq = Counter()
+        for n, cy, cx in cell_digits:
+            cell_freq[n] += 1
+
+        # ===== Step 1: 基于间距去除Y方向离群点 =====
+        # 排序后找大间距，将离群点（来自相邻cell的叠印）分离出去
+        y_sorted_all = sorted(cell_digits, key=lambda d: d[1])
+        
+        # 计算所有相邻Y间距
+        all_gaps = []
+        for i in range(1, len(y_sorted_all)):
+            gap = y_sorted_all[i][1] - y_sorted_all[i-1][1]
+            all_gaps.append((gap, i))
+        
+        # 找最大间距，如果>30px，认为是离群点分割
+        main_digits = list(y_sorted_all)
+        if all_gaps:
+            max_gap, max_gap_idx = max(all_gaps, key=lambda x: x[0])
+            if max_gap > 30:
+                # 大间距：去掉间距前的数字（离群点）
+                main_digits = y_sorted_all[max_gap_idx + 1:]
+        
+        # 如果主集群太小（<5），回退到IQR方法
+        if len(main_digits) < 5:
+            ys_all = [d[1] for d in cell_digits]
+            q1 = np.percentile(ys_all, 25)
+            q3 = np.percentile(ys_all, 75)
+            iqr_val = q3 - q1
+            lower_bound = q1 - 3 * iqr_val
+            upper_bound = q3 + 3 * iqr_val
+            main_digits = [d for d in cell_digits if lower_bound <= d[1] <= upper_bound]
+            if len(main_digits) < 5:
+                main_digits = list(cell_digits)
+
+        # ===== Step 2: Y位置分离红/蓝球 =====
+        y_sorted = sorted(main_digits, key=lambda d: d[1])
+        
+        # 计算相邻Y间距，找最大间距作为红/蓝分割点
+        y_gaps = []
+        for i in range(1, len(y_sorted)):
+            gap = y_sorted[i][1] - y_sorted[i-1][1]
+            y_gaps.append((gap, i))
+        
+        red_ball_set = set()
+        blue_ball_set = set()
+        
+        if len(y_gaps) > 0:
+            max_gap, max_gap_idx = max(y_gaps, key=lambda x: x[0])
+            
+            if max_gap > 2:  # 最小分割阈值
+                upper_part = y_sorted[:max_gap_idx + 1]
+                lower_part = y_sorted[max_gap_idx + 1:]
+                
+                # 上部 → 红球
+                for n, cy, cx in upper_part:
+                    red_ball_set.add(n)
+                
+                # 下部 → 蓝球 (仅1-16范围)
+                for n, cy, cx in lower_part:
+                    if 1 <= n <= 16:
+                        blue_ball_set.add(n)
+                
+                # ===== Step 2.5: 解决冲突 — 统计每个数字在上下部分的出现次数 =====
+                # 如果一个数字在下部出现次数 >= 上部出现次数，优先归蓝
+                upper_counts = Counter()
+                lower_counts = Counter()
+                for n, cy, cx in upper_part:
+                    upper_counts[n] += 1
+                for n, cy, cx in lower_part:
+                    lower_counts[n] += 1
+                
+                for n in list(red_ball_set & blue_ball_set):
+                    if 1 <= n <= 16:
+                        # 如果下部出现次数 >= 上部出现次数，归蓝
+                        if lower_counts.get(n, 0) >= upper_counts.get(n, 0):
+                            red_ball_set.discard(n)
+            else:
+                # Y间距太小，所有数字在同一行，全作为红球
+                for n, cy, cx in y_sorted:
+                    red_ball_set.add(n)
+        else:
+            # 只有1个数字
+            for n, cy, cx in y_sorted:
+                red_ball_set.add(n)
+
+        # ===== Step 3: 频次过滤 =====
+        red_filtered = set()
+        for n in red_ball_set:
+            if cell_freq[n] >= 1:
+                red_filtered.add(n)
+
+        blue_filtered = set()
+        for n in blue_ball_set:
+            if cell_freq[n] >= 1:
+                blue_filtered.add(n)
+
+        # ===== Step 4: 约束和补充 =====
+        red_final = sorted(red_filtered)
+        blue_final = sorted(blue_filtered)
+
+        # 如果蓝球为空，尝试从红球中找1-16范围的作为蓝球
+        if len(blue_final) < 1:
+            for n in red_final:
+                if 1 <= n <= 16:
+                    blue_final = [n]
+                    # 从红球中移除这个数
+                    red_final = [r for r in red_final if r != n]
+                    break
+
+        # 如果红球太少（<5），补充一些蓝球范围内的数
+        if len(red_final) < 5:
+            need = max(0, 5 - len(red_final))
+            for n in sorted(blue_filtered, key=lambda n: -cell_freq[n]):
+                if n not in red_final and need > 0:
+                    red_final.append(n)
+                    need -= 1
+            red_final.sort()
+
+        # 如果红球太多（>8），取频次最高的
+        if len(red_final) > 8:
+            red_final = sorted(red_final, key=lambda n: -cell_freq[n])[:8]
+            red_final.sort()
+
+        # 如果蓝球太多（>3），取频次最高的前3
+        if len(blue_final) > 3:
+            blue_final = sorted(blue_final, key=lambda n: -cell_freq[n])[:3]
+            blue_final.sort()
+
+        if len(red_final) >= 5 and len(blue_final) >= 1:
+            return {"red": red_final, "blue": blue_final, "times": 1}
+
+        return None
+
+    # ===== 使用动态cells =====
+    dynamic_scheme_groups = []
+    if dynamic_cells and len(dynamic_cells) >= 6:
+        if debug:
+            print(f"  使用动态网格: {len(dynamic_cells)} cells")
+        scheme_groups = []
+        for x1, y1, x2, y2 in dynamic_cells:
+            g = _parse_cell_digits(x1, y1, x2, y2)
+            if g and len(g.get("red", [])) >= 4 and len(g.get("blue", [])) >= 1:
+                scheme_groups.append(g)
+        
+        if debug:
+            print(f"    动态网格: 成功提取 {len(scheme_groups)} 组")
+        
+        if scheme_groups:
+            dynamic_scheme_groups = scheme_groups
+            all_candidates.append(scheme_groups)
+
+    # ===== 固定网格方案（作为补充）=====
     total_px = h * w
     est_count = max(1, round(total_px / 80000))
 
@@ -1486,8 +2145,6 @@ def _parse_grid_image(img, debug=False):
         grid_configs = [(2, 3, "2x3"), (3, 2, "3x2"), (4, 2, "4x2"), (2, 4, "2x4")]
     else:
         grid_configs = [_detect_grid_layout(img) + ("auto",)]
-
-    all_candidates = []  # 收集所有候选组 [[g1,g2...], [g3...], ...] 每个子list是一套网格方案的结果
 
     for rows, cols, label in grid_configs:
         cell_w = w / cols
@@ -1502,23 +2159,7 @@ def _parse_grid_image(img, debug=False):
                 y1 = max(0, int(r * cell_h) + margin)
                 x2 = min(w, int((c + 1) * cell_w) - margin)
                 y2 = min(h, int((r + 1) * cell_h) - margin)
-                sub_img = img[y1:y2, x1:x2]
-                if sub_img.size == 0:
-                    continue
-                # 先用简单频次法，成功直接用
-                g = _parse_sub_image_simple(sub_img, debug=False)
-                if not g:
-                    # 失败，回退完整parse_lottery_image
-                    tmp_path = os.path.join(tempfile.gettempdir(),
-                                            f"ssq_sub_{label}_{r}_{c}.png")
-                    cv2.imwrite(tmp_path, sub_img)
-                    fallback = parse_lottery_image(tmp_path, debug=False, _is_sub=True)
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-                    if fallback:
-                        g = max(fallback, key=lambda x: len(x.get("red", [])))
+                g = _parse_cell_digits(x1, y1, x2, y2)
                 if g and len(g.get("red", [])) >= 4 and len(g.get("blue", [])) >= 1:
                     scheme_groups.append(g)
         if debug:
@@ -1530,7 +2171,7 @@ def _parse_grid_image(img, debug=False):
         return []
 
     # 合并所有方案的结果，去重
-    merged = merge_unique_groups(all_candidates, debug=False, keep_n=12)
+    merged = merge_unique_groups(all_candidates, debug=debug, keep_n=12)
     if debug:
         print(f"  [网格合并] {sum(len(x) for x in all_candidates)} 候选 → {len(merged)} 组")
     return merged
@@ -1681,12 +2322,60 @@ def parse_lottery_image(img_path, debug=False, _is_sub=False):
                     if debug:
                         print(f"  [D2:{src_name}-X分区空间] 解析到 {len(sg_dz)} 组")
     
-    # --- 策略E: 网格裁剪子图独立解析的结果（不提前return，参与合并投票）---
-    # 当前网格策略质量不稳定，默认关闭。在号码拆分修复后，全局parse本身就能拿到10/12组正确。
-    # 后续可通过提高 _parse_sub_image_simple 质量后重新启用。
-    E_ENABLED = False
+    # --- 策略E: 网格裁剪子图独立解析的结果 ---
+    # 当网格策略能识别出足够多的组（>=8组），直接使用网格结果
+    # 因为网格策略基于OCR密度检测边界，对子图单独识别，避免了叠印干扰
+    E_ENABLED = True
+    if E_ENABLED and grid_strategy_groups and len(grid_strategy_groups) >= 8:
+        if debug:
+            print(f"  [E:网格裁剪] 直接使用网格结果: {len(grid_strategy_groups)} 组 (跳过合并)")
+        # 直接返回网格结果，跳过所有合并
+        final = []
+        for g in grid_strategy_groups:
+            reds = [int(r) for r in g.get("red", [])]
+            blues = [int(b) for b in g.get("blue", [])]
+            # 基础清理：红球去重、蓝球去重
+            reds = sorted(set(reds))
+            blues = sorted(set(blues))
+            if len(reds) >= 5 and len(blues) >= 1:
+                final.append({"red": reds, "blue": blues})
+        
+        # 去重
+        if len(final) > 12:
+            def _jaccard(a, b):
+                sa, sb = set(a), set(b)
+                if not sa and not sb:
+                    return 1.0
+                return len(sa & sb) / len(sa | sb)
+            
+            def _quality_key(g):
+                s = 0
+                rc = len(g["red"]); bc = len(g["blue"])
+                if 6 <= rc <= 12: s += 50 - abs(9-rc)
+                if 1 <= bc <= 4: s += 30 - bc
+                if rc > 0:
+                    rng = max(g["red"]) - min(g["red"])
+                    if rng >= 15: s += 20
+                return s
+            
+            final.sort(key=_quality_key, reverse=True)
+            
+            deduped = []
+            for g in final:
+                is_dup = False
+                for kept in deduped:
+                    rj = _jaccard(g["red"], kept["red"])
+                    if rj > 0.85:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    deduped.append(g)
+            final = deduped[:12]
+        
+        return final
+    
+    # 网格结果不足时，回退到合并策略
     if E_ENABLED and grid_strategy_groups:
-        # 网格策略的组结果单独作为一个策略项加入合并投票池
         all_strategy_groups.append(grid_strategy_groups)
         if debug:
             print(f"  [E:网格裁剪] 作为独立策略加入合并: {len(grid_strategy_groups)} 组")
@@ -1745,20 +2434,40 @@ def parse_lottery_image(img_path, debug=False, _is_sub=False):
     final_groups = repaired
 
     # ===== 最终数量限制：最多12组（复式彩票最常见12组上限）=====
-    # 如果超过12组，按红球数量合理性+蓝球合理性再排一次
+    # 先去重（移除红球相似度>0.85的重复组）
     if len(final_groups) > 12:
-        def _final_sort_key(g):
+        def _jaccard(a, b):
+            sa, sb = set(a), set(b)
+            if not sa and not sb:
+                return 1.0
+            return len(sa & sb) / len(sa | sb)
+        
+        # 按质量排序（红球数量合理+蓝球数量合理）
+        def _quality_key(g):
             s = 0
             rc = len(g["red"]); bc = len(g["blue"])
             if 6 <= rc <= 12: s += 50 - abs(9-rc)
             if 1 <= bc <= 4: s += 30 - bc
-            # 无重复号码、范围分布合理加分
             if rc > 0:
                 rng = max(g["red"]) - min(g["red"])
                 if rng >= 15: s += 20
             return s
-        final_groups.sort(key=_final_sort_key, reverse=True)
-        final_groups = final_groups[:12]
+        
+        final_groups.sort(key=_quality_key, reverse=True)
+        
+        # 贪心去重：保留质量最高的，跳过与已保留组相似的
+        deduped = []
+        for g in final_groups:
+            is_dup = False
+            for kept in deduped:
+                rj = _jaccard(g["red"], kept["red"])
+                if rj > 0.85:
+                    is_dup = True
+                    break
+            if not is_dup:
+                deduped.append(g)
+        
+        final_groups = deduped[:12]
 
     if debug:
         print(f"  [最终] 合并去重后 {len(final_groups)} 组")
